@@ -60,6 +60,9 @@ pub struct MultiFileDataSource {
     /// List of (glob, optional filesystem) pairs to resolve.
     /// When the filesystem is None, a local filesystem will be created in build().
     glob_sources: Vec<(String, Option<FileSystemRef>)>,
+    /// Pre-resolved file listings that skip glob expansion. The caller is responsible for
+    /// supplying the [`FileListing::size`] when stats reporting matters.
+    listing_sources: Vec<(FileListing, FileSystemRef)>,
     open_options_fn: Arc<dyn Fn(VortexOpenOptions) -> VortexOpenOptions + Send + Sync>,
 }
 
@@ -69,6 +72,7 @@ impl MultiFileDataSource {
         Self {
             session,
             glob_sources: Vec::new(),
+            listing_sources: Vec::new(),
             open_options_fn: Arc::new(|opts| opts),
         }
     }
@@ -94,6 +98,23 @@ impl MultiFileDataSource {
         self
     }
 
+    /// Add a pre-resolved file listing.
+    ///
+    /// Use this when the caller already knows the exact file path and (optionally) its size,
+    /// avoiding the glob expansion done by [`Self::with_glob`]. Supplying
+    /// [`FileListing::size`] is required for [`DataSource::byte_size`] to surface a contribution
+    /// from this file; otherwise the source size remains unknown for this file and the
+    /// data-source-level total is extrapolated from the files that do report a size.
+    pub fn with_listing(mut self, listing: FileListing, fs: FileSystemRef) -> Self {
+        let FileListing { path, size } = listing;
+        let listing = FileListing {
+            path: path.trim_start_matches('/').to_string(),
+            size,
+        };
+        self.listing_sources.push((listing, fs));
+        self
+    }
+
     /// Customize [`VortexOpenOptions`] applied to each file.
     ///
     /// Use this to configure segment caches, metrics registries, or other per-file options.
@@ -110,8 +131,10 @@ impl MultiFileDataSource {
     /// Discovers files via glob, opens the first file eagerly to determine the schema,
     /// and creates lazy factories for the remaining files.
     pub async fn build(self) -> VortexResult<MultiLayoutDataSource> {
-        if self.glob_sources.is_empty() {
-            vortex_bail!("MultiFileDataSource requires at least one glob pattern");
+        if self.glob_sources.is_empty() && self.listing_sources.is_empty() {
+            vortex_bail!(
+                "MultiFileDataSource requires at least one glob pattern or pre-resolved listing"
+            );
         }
 
         // Create local filesystem lazily if needed (only if any glob lacks a filesystem).
@@ -139,6 +162,7 @@ impl MultiFileDataSource {
                 all_files.push((file, Arc::clone(&fs)));
             }
         }
+        all_files.extend(self.listing_sources);
 
         if all_files.is_empty() {
             let globs: Vec<_> = self.glob_sources.iter().map(|(g, _)| g.as_str()).collect();
@@ -155,6 +179,8 @@ impl MultiFileDataSource {
         let first_file = open_file(first_fs, first_file_listing, &self.session, open_fn).await?;
         let first_reader = first_file.layout_reader()?;
 
+        let byte_sizes: Vec<Option<u64>> = all_files.iter().map(|(file, _)| file.size).collect();
+
         let factories: Vec<Arc<dyn LayoutReaderFactory>> = all_files[1..]
             .iter()
             .map(|(file, fs)| {
@@ -167,7 +193,12 @@ impl MultiFileDataSource {
             })
             .collect();
 
-        let inner = MultiLayoutDataSource::new_with_first(first_reader, factories, &self.session);
+        let inner = MultiLayoutDataSource::new_with_first(
+            first_reader,
+            factories,
+            byte_sizes,
+            &self.session,
+        );
 
         debug!(file_count, dtype = %inner.dtype(), "built MultiFileDataSource");
 
