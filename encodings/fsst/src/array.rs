@@ -808,7 +808,7 @@ mod test {
         let compressor = Compressor::rebuild_from(symbols.as_slice(), symbol_lengths.as_slice());
         let mut ctx = LEGACY_SESSION.create_execution_ctx();
         let input = VarBinViewArray::from_iter_str(["abcabcab", "defghijk"]);
-        let fsst_array = fsst_compress(&input, &compressor, &mut ctx).unwrap();
+        let fsst_array = fsst_compress(input.into_array(), &compressor, &mut ctx).unwrap();
 
         let compressed_codes = fsst_array.codes();
 

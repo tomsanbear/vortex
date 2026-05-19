@@ -207,8 +207,8 @@ mod tests {
     use vortex::array::assert_arrays_eq;
     use vortex::dtype::DType;
     use vortex::dtype::Nullability;
-    use vortex::encodings::fsst::fsst_compress_varbin;
-    use vortex::encodings::fsst::fsst_train_compressor_varbin;
+    use vortex::encodings::fsst::fsst_compress;
+    use vortex::encodings::fsst::fsst_train_compressor;
     use vortex::error::VortexExpect;
     use vortex::session::VortexSession;
 
@@ -240,10 +240,9 @@ mod tests {
         let mut cuda_ctx = CudaSession::create_execution_ctx(&VortexSession::empty())
             .vortex_expect("failed to create execution context");
 
-        let varbin = VarBinArray::from_iter(strings, DType::Binary(nullability));
-        let compressor = fsst_train_compressor_varbin(&varbin, cuda_ctx.execution_ctx())?;
-        let fsst_array =
-            fsst_compress_varbin(&varbin, &compressor, cuda_ctx.execution_ctx())?.into_array();
+        let varbin = VarBinArray::from_iter(strings, DType::Binary(nullability)).into_array();
+        let compressor = fsst_train_compressor(varbin.clone(), cuda_ctx.execution_ctx())?;
+        let fsst_array = fsst_compress(varbin, &compressor, cuda_ctx.execution_ctx())?.into_array();
 
         let cpu_result = crate::canonicalize_cpu(fsst_array.clone())?;
         let gpu_result = FSSTExecutor

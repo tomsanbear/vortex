@@ -180,8 +180,8 @@ pub fn T::uncompressed_lengths(&self) -> &vortex_array::array::erased::ArrayRef
 
 pub fn T::uncompressed_lengths_dtype(&self) -> &vortex_array::dtype::DType
 
-pub fn vortex_fsst::fsst_compress(&vortex_array::arrays::varbinview::vtable::VarBinViewArray, &fsst::Compressor, &mut vortex_array::executor::ExecutionCtx) -> vortex_error::VortexResult<vortex_fsst::FSSTArray>
+pub fn vortex_fsst::fsst_compress(vortex_array::array::erased::ArrayRef, &fsst::Compressor, &mut vortex_array::executor::ExecutionCtx) -> vortex_error::VortexResult<vortex_fsst::FSSTArray>
 
-pub fn vortex_fsst::fsst_train_compressor(&vortex_array::arrays::varbinview::vtable::VarBinViewArray, &mut vortex_array::executor::ExecutionCtx) -> vortex_error::VortexResult<fsst::Compressor>
+pub fn vortex_fsst::fsst_train_compressor(vortex_array::array::erased::ArrayRef, &mut vortex_array::executor::ExecutionCtx) -> vortex_error::VortexResult<fsst::Compressor>
 
 pub type vortex_fsst::FSSTArray = vortex_array::array::typed::Array<vortex_fsst::FSST>

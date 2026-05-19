@@ -103,8 +103,8 @@ mod tests {
     use vortex_error::VortexResult;
     use vortex_session::VortexSession;
 
-    use crate::fsst_compress_varbin;
-    use crate::fsst_train_compressor_varbin;
+    use crate::fsst_compress;
+    use crate::fsst_train_compressor;
 
     static SESSION: LazyLock<VortexSession> =
         LazyLock::new(|| VortexSession::empty().with::<ArraySession>());
@@ -115,10 +115,11 @@ mod tests {
         let strings = VarBinArray::from_iter(
             vec![Some("hello"), Some("world"), Some("hello world")],
             DType::Utf8(Nullability::NonNullable),
-        );
+        )
+        .into_array();
 
-        let compressor = fsst_train_compressor_varbin(&strings, &mut ctx)?;
-        let fsst = fsst_compress_varbin(&strings, &compressor, &mut ctx)?;
+        let compressor = fsst_train_compressor(strings.clone(), &mut ctx)?;
+        let fsst = fsst_compress(strings, &compressor, &mut ctx)?;
 
         // Cast to nullable
         let casted = fsst.into_array().cast(DType::Utf8(Nullability::Nullable))?;
@@ -141,8 +142,9 @@ mod tests {
     ))]
     fn test_cast_fsst_conformance(#[case] array: VarBinArray) -> VortexResult<()> {
         let mut ctx = SESSION.create_execution_ctx();
-        let compressor = fsst_train_compressor_varbin(&array, &mut ctx)?;
-        let fsst = fsst_compress_varbin(&array, &compressor, &mut ctx)?;
+        let array = array.into_array();
+        let compressor = fsst_train_compressor(array.clone(), &mut ctx)?;
+        let fsst = fsst_compress(array, &compressor, &mut ctx)?;
         test_cast_conformance(&fsst.into_array());
         Ok(())
     }

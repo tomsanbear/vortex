@@ -12,8 +12,8 @@ use vortex::array::arrays::VarBinArray;
 use vortex::array::dtype::FieldNames;
 use vortex::array::validity::Validity;
 use vortex::encodings::fsst::FSST;
-use vortex::encodings::fsst::fsst_compress_varbin;
-use vortex::encodings::fsst::fsst_train_compressor_varbin;
+use vortex::encodings::fsst::fsst_compress;
+use vortex::encodings::fsst::fsst_train_compressor;
 use vortex::error::VortexResult;
 
 use super::N;
@@ -45,7 +45,7 @@ impl FlatLayoutFixture for FsstFixture {
             .map(|i| format!("{}{}", prefixes[i % prefixes.len()], i))
             .collect();
         let url_refs: Vec<&str> = urls.iter().map(|s| s.as_str()).collect();
-        let url_col = VarBinArray::from_strs(url_refs);
+        let url_col = VarBinArray::from_strs(url_refs).into_array();
 
         let severities = ["INFO", "WARN", "ERROR", "DEBUG"];
         let components = ["auth", "db", "cache", "api"];
@@ -60,36 +60,36 @@ impl FlatLayoutFixture for FsstFixture {
             })
             .collect();
         let log_refs: Vec<&str> = logs.iter().map(|s| s.as_str()).collect();
-        let log_col = VarBinArray::from_strs(log_refs);
+        let log_col = VarBinArray::from_strs(log_refs).into_array();
 
         let nullable_urls: Vec<Option<String>> = (0..N)
             .map(|i| (i % 7 != 0).then(|| format!("{}{}", prefixes[i % prefixes.len()], i * 3)))
             .collect();
         let nullable_refs: Vec<Option<&str>> = nullable_urls.iter().map(|s| s.as_deref()).collect();
-        let nullable_col = VarBinArray::from_nullable_strs(nullable_refs);
+        let nullable_col = VarBinArray::from_nullable_strs(nullable_refs).into_array();
 
         let short_tokens = ["a", "bb", "ccc", "dd", "e"];
         let short_strs: Vec<&str> = (0..N)
             .map(|i| short_tokens[i % short_tokens.len()])
             .collect();
-        let short_col = VarBinArray::from_strs(short_strs);
+        let short_col = VarBinArray::from_strs(short_strs).into_array();
         let empty_and_unicode_values =
             ["", "こんにちは", "😀", "naive", "façade", "résumé", "مرحبا"];
         let empty_and_unicode: Vec<&str> = (0..N)
             .map(|i| empty_and_unicode_values[i % empty_and_unicode_values.len()])
             .collect();
-        let empty_and_unicode_col = VarBinArray::from_strs(empty_and_unicode);
+        let empty_and_unicode_col = VarBinArray::from_strs(empty_and_unicode).into_array();
         let suffix_shared_values: Vec<String> = (0..N)
             .map(|i| format!("prefix-{:04}-common-suffix", i % 64))
             .collect();
         let suffix_shared_refs: Vec<&str> =
             suffix_shared_values.iter().map(String::as_str).collect();
-        let suffix_shared_col = VarBinArray::from_strs(suffix_shared_refs);
+        let suffix_shared_col = VarBinArray::from_strs(suffix_shared_refs).into_array();
         let high_entropy_values: Vec<String> = (0..N)
             .map(|i| format!("{:016x}{:016x}", i.wrapping_mul(97), i.wrapping_mul(13_579)))
             .collect();
         let high_entropy_refs: Vec<&str> = high_entropy_values.iter().map(String::as_str).collect();
-        let high_entropy_col = VarBinArray::from_strs(high_entropy_refs);
+        let high_entropy_col = VarBinArray::from_strs(high_entropy_refs).into_array();
         let all_null_clustered = VarBinArray::from_nullable_strs(
             (0..N)
                 .map(|i| {
@@ -100,18 +100,19 @@ impl FlatLayoutFixture for FsstFixture {
                     }
                 })
                 .collect::<Vec<_>>(),
-        );
+        )
+        .into_array();
 
         let mut ctx = LEGACY_SESSION.create_execution_ctx();
-        let url_comp = fsst_train_compressor_varbin(&url_col, &mut ctx)?;
-        let log_comp = fsst_train_compressor_varbin(&log_col, &mut ctx)?;
-        let nullable_comp = fsst_train_compressor_varbin(&nullable_col, &mut ctx)?;
-        let short_comp = fsst_train_compressor_varbin(&short_col, &mut ctx)?;
+        let url_comp = fsst_train_compressor(url_col.clone(), &mut ctx)?;
+        let log_comp = fsst_train_compressor(log_col.clone(), &mut ctx)?;
+        let nullable_comp = fsst_train_compressor(nullable_col.clone(), &mut ctx)?;
+        let short_comp = fsst_train_compressor(short_col.clone(), &mut ctx)?;
         let empty_and_unicode_comp =
-            fsst_train_compressor_varbin(&empty_and_unicode_col, &mut ctx)?;
-        let suffix_shared_comp = fsst_train_compressor_varbin(&suffix_shared_col, &mut ctx)?;
-        let high_entropy_comp = fsst_train_compressor_varbin(&high_entropy_col, &mut ctx)?;
-        let all_null_clustered_comp = fsst_train_compressor_varbin(&all_null_clustered, &mut ctx)?;
+            fsst_train_compressor(empty_and_unicode_col.clone(), &mut ctx)?;
+        let suffix_shared_comp = fsst_train_compressor(suffix_shared_col.clone(), &mut ctx)?;
+        let high_entropy_comp = fsst_train_compressor(high_entropy_col.clone(), &mut ctx)?;
+        let all_null_clustered_comp = fsst_train_compressor(all_null_clustered.clone(), &mut ctx)?;
 
         let arr = StructArray::try_new(
             FieldNames::from([
@@ -125,17 +126,15 @@ impl FlatLayoutFixture for FsstFixture {
                 "all_null_clustered",
             ]),
             vec![
-                fsst_compress_varbin(&url_col, &url_comp, &mut ctx)?.into_array(),
-                fsst_compress_varbin(&log_col, &log_comp, &mut ctx)?.into_array(),
-                fsst_compress_varbin(&nullable_col, &nullable_comp, &mut ctx)?.into_array(),
-                fsst_compress_varbin(&short_col, &short_comp, &mut ctx)?.into_array(),
-                fsst_compress_varbin(&empty_and_unicode_col, &empty_and_unicode_comp, &mut ctx)?
+                fsst_compress(url_col, &url_comp, &mut ctx)?.into_array(),
+                fsst_compress(log_col, &log_comp, &mut ctx)?.into_array(),
+                fsst_compress(nullable_col, &nullable_comp, &mut ctx)?.into_array(),
+                fsst_compress(short_col, &short_comp, &mut ctx)?.into_array(),
+                fsst_compress(empty_and_unicode_col, &empty_and_unicode_comp, &mut ctx)?
                     .into_array(),
-                fsst_compress_varbin(&suffix_shared_col, &suffix_shared_comp, &mut ctx)?
-                    .into_array(),
-                fsst_compress_varbin(&high_entropy_col, &high_entropy_comp, &mut ctx)?.into_array(),
-                fsst_compress_varbin(&all_null_clustered, &all_null_clustered_comp, &mut ctx)?
-                    .into_array(),
+                fsst_compress(suffix_shared_col, &suffix_shared_comp, &mut ctx)?.into_array(),
+                fsst_compress(high_entropy_col, &high_entropy_comp, &mut ctx)?.into_array(),
+                fsst_compress(all_null_clustered, &all_null_clustered_comp, &mut ctx)?.into_array(),
             ],
             N,
             Validity::NonNullable,

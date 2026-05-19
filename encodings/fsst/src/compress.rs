@@ -3,33 +3,31 @@
 
 //! FSST compression entry points.
 //!
-//! [`fsst_compress`] / [`fsst_train_compressor`] take `&VarBinViewArray` and are
-//! the production path. [`fsst_compress_varbin`] / [`fsst_train_compressor_varbin`]
-//! take `&VarBinArray` and are gated behind the `_test-harness` feature for use
-//! by bench and test fixtures.
+//! [`fsst_compress`] and [`fsst_train_compressor`] take an [`ArrayRef`] and dispatch
+//! on the input encoding ([`VarBinView`] or [`VarBin`]). Callers don't need to know
+//! which string encoding they hold.
 
 use fsst::Compressor;
-#[cfg(any(test, feature = "_test-harness"))]
 use num_traits::AsPrimitive;
+use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
-#[cfg(any(test, feature = "_test-harness"))]
 use vortex_array::arrays::PrimitiveArray;
-#[cfg(any(test, feature = "_test-harness"))]
+use vortex_array::arrays::VarBin;
 use vortex_array::arrays::VarBinArray;
+use vortex_array::arrays::VarBinView;
 use vortex_array::arrays::VarBinViewArray;
-#[cfg(any(test, feature = "_test-harness"))]
 use vortex_array::arrays::varbin::VarBinArrayExt;
 use vortex_array::arrays::varbin::builder::VarBinBuilder;
 use vortex_array::arrays::varbinview::BinaryView;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::IntegerPType;
-#[cfg(any(test, feature = "_test-harness"))]
 use vortex_array::match_each_integer_ptype;
 use vortex_buffer::Buffer;
 use vortex_buffer::BufferMut;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
+use vortex_error::vortex_bail;
 use vortex_mask::AllOr;
 use vortex_mask::Mask;
 
@@ -44,8 +42,43 @@ const FSST_PER_ROW_OVERHEAD: usize = 7;
 /// Starting capacity for the per-row `compress_into` scratch buffer; grown monotonically.
 const DEFAULT_BUFFER_LEN: usize = 1024 * 1024;
 
-/// Compress a [`VarBinViewArray`] using FSST.
+/// Compress a string array using FSST.
+///
+/// Accepts any [`VarBinView`] or [`VarBin`]-encoded array; other encodings error.
 pub fn fsst_compress(
+    array: ArrayRef,
+    compressor: &Compressor,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<FSSTArray> {
+    if let Some(view) = array.as_opt::<VarBinView>() {
+        compress_varbinview(&view.into_owned(), compressor, ctx)
+    } else if let Some(varbin) = array.as_opt::<VarBin>() {
+        compress_varbin_array(&varbin.into_owned(), compressor, ctx)
+    } else {
+        vortex_bail!(
+            "fsst_compress requires VarBinView or VarBin encoding, got {}",
+            array.encoding_id()
+        )
+    }
+}
+
+/// Train an FSST [`Compressor`] from a string array's non-null rows.
+///
+/// Accepts any [`VarBinView`] or [`VarBin`]-encoded array; other encodings error.
+pub fn fsst_train_compressor(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Compressor> {
+    if let Some(view) = array.as_opt::<VarBinView>() {
+        train_varbinview(&view.into_owned(), ctx)
+    } else if let Some(varbin) = array.as_opt::<VarBin>() {
+        train_varbin_array(&varbin.into_owned(), ctx)
+    } else {
+        vortex_bail!(
+            "fsst_train_compressor requires VarBinView or VarBin encoding, got {}",
+            array.encoding_id()
+        )
+    }
+}
+
+fn compress_varbinview(
     strings: &VarBinViewArray,
     compressor: &Compressor,
     ctx: &mut ExecutionCtx,
@@ -72,9 +105,7 @@ pub fn fsst_compress(
     }
 }
 
-/// Compress a [`VarBinArray`] using FSST.
-#[cfg(any(test, feature = "_test-harness"))]
-pub fn fsst_compress_varbin(
+fn compress_varbin_array(
     strings: &VarBinArray,
     compressor: &Compressor,
     ctx: &mut ExecutionCtx,
@@ -96,11 +127,7 @@ pub fn fsst_compress_varbin(
     }
 }
 
-/// Train an FSST [`Compressor`] from a [`VarBinViewArray`]'s non-null rows.
-pub fn fsst_train_compressor(
-    strings: &VarBinViewArray,
-    ctx: &mut ExecutionCtx,
-) -> VortexResult<Compressor> {
+fn train_varbinview(strings: &VarBinViewArray, ctx: &mut ExecutionCtx) -> VortexResult<Compressor> {
     let mask = strings.validity()?.execute_mask(strings.len(), ctx)?;
     let views = strings.views();
     let mut lines: Vec<&[u8]> = Vec::with_capacity(views.len());
@@ -124,12 +151,7 @@ pub fn fsst_train_compressor(
     Ok(Compressor::train(&lines))
 }
 
-/// Train an FSST [`Compressor`] from a [`VarBinArray`]'s non-null rows.
-#[cfg(any(test, feature = "_test-harness"))]
-pub fn fsst_train_compressor_varbin(
-    strings: &VarBinArray,
-    ctx: &mut ExecutionCtx,
-) -> VortexResult<Compressor> {
+fn train_varbin_array(strings: &VarBinArray, ctx: &mut ExecutionCtx) -> VortexResult<Compressor> {
     let mask = strings.validity()?.execute_mask(strings.len(), ctx)?;
     let offsets = strings.offsets().clone().execute::<PrimitiveArray>(ctx)?;
     let bytes = strings.bytes().as_slice();
@@ -196,7 +218,6 @@ where
     sink.finish(strings.dtype().clone(), ctx)
 }
 
-#[cfg(any(test, feature = "_test-harness"))]
 fn compress_varbin<O>(
     strings: &VarBinArray,
     offsets: &PrimitiveArray,
@@ -218,7 +239,6 @@ where
 
 /// Call `f` once per row of a `VarBinArray` with the row bytes or `None`.
 /// Validity dispatch is hoisted out of the per-row loop.
-#[cfg(any(test, feature = "_test-harness"))]
 #[inline]
 fn for_each_varbin_row<'a, I, F>(off: &[I], bytes: &'a [u8], mask: &Mask, mut f: F)
 where
@@ -301,6 +321,7 @@ impl<'c, O: IntegerPType + 'static> FsstSink<'c, O> {
 
 #[cfg(test)]
 mod tests {
+    use vortex_array::IntoArray;
     use vortex_array::LEGACY_SESSION;
     use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::VarBinViewArray;
@@ -330,8 +351,8 @@ mod tests {
     fn codes_offsets_dtype_small_input_is_i32() -> VortexResult<()> {
         let array = VarBinViewArray::from_iter_str(["hello", "world", "fsst encoded"]);
         let mut ctx = LEGACY_SESSION.create_execution_ctx();
-        let compressor = fsst_train_compressor(&array, &mut ctx)?;
-        let fsst = fsst_compress(&array, &compressor, &mut ctx)?;
+        let compressor = fsst_train_compressor(array.clone().into_array(), &mut ctx)?;
+        let fsst = fsst_compress(array.into_array(), &compressor, &mut ctx)?;
         assert_eq!(fsst.codes().offsets().dtype().as_ptype(), PType::I32);
         Ok(())
     }

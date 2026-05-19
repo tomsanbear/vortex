@@ -136,8 +136,8 @@ mod tests {
     use vortex_array::scalar_fn::fns::operators::Operator;
     use vortex_error::VortexResult;
 
-    use crate::fsst_compress_varbin;
-    use crate::fsst_train_compressor_varbin;
+    use crate::fsst_compress;
+    use crate::fsst_train_compressor;
 
     #[test]
     #[cfg_attr(miri, ignore)]
@@ -152,9 +152,10 @@ mod tests {
                 Some("this is a very long string"),
             ],
             DType::Utf8(Nullability::Nullable),
-        );
-        let compressor = fsst_train_compressor_varbin(&lhs, &mut ctx)?;
-        let lhs = fsst_compress_varbin(&lhs, &compressor, &mut ctx)?;
+        )
+        .into_array();
+        let compressor = fsst_train_compressor(lhs.clone(), &mut ctx)?;
+        let lhs = fsst_compress(lhs, &compressor, &mut ctx)?;
 
         let rhs = ConstantArray::new("world", lhs.len());
 
