@@ -5,6 +5,7 @@ pub mod types;
 
 #[rustfmt::skip]
 #[expect(warnings, clippy::all, clippy::pedantic, clippy::nursery)]
+#[allow(clippy::absolute_paths)]
 pub mod gpu {
     include!(concat!(env!("OUT_DIR"), "/patches.rs"));
 }
@@ -31,6 +32,7 @@ use crate::kernel::patches::gpu::ChunkOffsetType_CO_U16;
 use crate::kernel::patches::gpu::ChunkOffsetType_CO_U32;
 use crate::kernel::patches::gpu::ChunkOffsetType_CO_U64;
 use crate::kernel::patches::gpu::GPUPatches;
+use crate::kernel::patches::gpu::PATCH_DERIVE_INDICES_BASE;
 use crate::kernel::patches::types::DevicePatches;
 
 // Safe because `GPUPatches` contains only raw pointers, POD integers, and an enum.
@@ -48,11 +50,12 @@ impl GPUPatches {
         offset_within_chunk: 0,
         num_patches: 0,
         n_chunks: 0,
+        indices_base: 0,
     };
 }
 
 /// Convert a [`PType`] to the corresponding [`ChunkOffsetType`] for GPU patches.
-fn ptype_to_chunk_offset_type(ptype: PType) -> VortexResult<ChunkOffsetType> {
+pub(crate) fn ptype_to_chunk_offset_type(ptype: PType) -> VortexResult<ChunkOffsetType> {
     match ptype {
         PType::U8 => Ok(ChunkOffsetType_CO_U8),
         PType::U16 => Ok(ChunkOffsetType_CO_U16),
@@ -80,6 +83,9 @@ pub(crate) fn build_gpu_patches(
             offset_within_chunk: p.offset_within_chunk as u32,
             num_patches: p.num_patches as u32,
             n_chunks: p.n_chunks as u32,
+            indices_base: p
+                .indices_base
+                .map_or(PATCH_DERIVE_INDICES_BASE, |base| base as u32),
         }),
         None => Ok(GPUPatches::NULL_PATCHES),
     }

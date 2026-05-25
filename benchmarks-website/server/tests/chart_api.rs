@@ -118,6 +118,93 @@ async fn chart_api_returns_payload_shape() -> Result<()> {
 }
 
 #[tokio::test]
+async fn default_chart_api_serves_materialized_encoded_artifact() -> Result<()> {
+    let server = Server::start().await?;
+    seed(&server).await?;
+
+    let slug = pick_chart_slug(&server, |s| s.starts_with("TPC-H")).await?;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(server.url(&format!("/api/chart/{slug}")))
+        .header(reqwest::header::ACCEPT_ENCODING, "gzip")
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get(reqwest::header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok()),
+        Some("gzip"),
+        "default latest-100 chart endpoint should serve precompressed gzip"
+    );
+    assert!(
+        resp.headers()
+            .get(reqwest::header::VARY)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.eq_ignore_ascii_case("Accept-Encoding")),
+        "materialized artifact should vary on Accept-Encoding"
+    );
+    let etag = resp
+        .headers()
+        .get(reqwest::header::ETAG)
+        .cloned()
+        .context("materialized chart ETag")?;
+    assert!(
+        resp.headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .is_some(),
+        "materialized artifact should carry Content-Length"
+    );
+
+    let not_modified = client
+        .get(server.url(&format!("/api/chart/{slug}")))
+        .header(reqwest::header::IF_NONE_MATCH, etag)
+        .send()
+        .await?;
+    assert_eq!(not_modified.status(), 304);
+    Ok(())
+}
+
+#[tokio::test]
+async fn chart_api_reports_virtual_history_for_bounded_and_full_windows() -> Result<()> {
+    let server = Server::start().await?;
+    seed_long_history(&server, 125).await?;
+
+    let slug = pick_chart_slug(&server, |s| s == "Random Access").await?;
+    let client = reqwest::Client::new();
+
+    let bounded: Value = client
+        .get(server.url(&format!("/api/chart/{slug}")))
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(
+        bounded["commits"].as_array().map(Vec::len),
+        Some(100),
+        "default materialized chart payload should stay latest-100"
+    );
+    assert_eq!(bounded["history"]["total_commits"].as_u64(), Some(125));
+    assert_eq!(bounded["history"]["start_index"].as_u64(), Some(25));
+    assert_eq!(bounded["history"]["loaded_commits"].as_u64(), Some(100));
+    assert_eq!(bounded["history"]["complete"].as_bool(), Some(false));
+
+    let all: Value = client
+        .get(server.url(&format!("/api/chart/{slug}?n=all")))
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(all["commits"].as_array().map(Vec::len), Some(125));
+    assert_eq!(all["history"]["total_commits"].as_u64(), Some(125));
+    assert_eq!(all["history"]["start_index"].as_u64(), Some(0));
+    assert_eq!(all["history"]["loaded_commits"].as_u64(), Some(125));
+    assert_eq!(all["history"]["complete"].as_bool(), Some(true));
+    Ok(())
+}
+
+#[tokio::test]
 async fn chart_page_window_caps_commits() -> Result<()> {
     let server = Server::start().await?;
     seed(&server).await?;
@@ -146,7 +233,7 @@ async fn chart_page_window_caps_commits() -> Result<()> {
     let one_count = one["commits"].as_array().map(|a| a.len()).unwrap_or(0);
     assert_eq!(one_count, 1, "?n=1 should keep exactly one commit");
 
-    // ?n=all returns the unbounded view (the per-chart hard cap is gone).
+    // ?n=all remains the explicit full-history view.
     let all: Value = client
         .get(server.url(&format!("/api/chart/{slug}?n=all")))
         .send()
@@ -156,7 +243,15 @@ async fn chart_page_window_caps_commits() -> Result<()> {
     let all_count = all["commits"].as_array().map(|a| a.len()).unwrap_or(0);
     assert_eq!(all_count, full_count, "?n=all should match unbounded view");
 
-    // Even very large `?n` survives without being clamped.
+    // Very large numeric `?n` values are clamped to MAX_NUMERIC_COMMIT_WINDOW
+    // at parse time (see the `commit_window_parse_floors_zero_and_clamps_large_values`
+    // unit test in `api/window.rs`, which is the strong contract). This
+    // integration test sanity-checks the round-trip on a small fixture: the
+    // clamp is well above the fixture's 3 commits, so the visible count
+    // matches the default response. The contract is "clamp is applied;
+    // huge_count is <= MAX_NUMERIC_COMMIT_WINDOW AND equals
+    // min(MAX_NUMERIC_COMMIT_WINDOW, full_count)" rather than the prior
+    // tautological `huge_count == full_count`.
     let huge: Value = client
         .get(server.url(&format!("/api/chart/{slug}?n=99999")))
         .send()
@@ -164,9 +259,14 @@ async fn chart_page_window_caps_commits() -> Result<()> {
         .json()
         .await?;
     let huge_count = huge["commits"].as_array().map(|a| a.len()).unwrap_or(0);
+    assert!(
+        huge_count <= 1_000,
+        "?n=99999 should be clamped to <= MAX_NUMERIC_COMMIT_WINDOW (1000), got {huge_count}"
+    );
     assert_eq!(
-        huge_count, full_count,
-        "?n=99999 should no longer be clamped to 1000"
+        huge_count,
+        full_count.min(1_000),
+        "?n=99999 should equal min(MAX_NUMERIC_COMMIT_WINDOW, fixture)"
     );
 
     // Malformed ?n gracefully falls back to default.

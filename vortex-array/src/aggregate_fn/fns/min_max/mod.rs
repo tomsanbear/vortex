@@ -46,14 +46,8 @@ static NAMES: LazyLock<FieldNames> = LazyLock::new(|| FieldNames::from(["min", "
 /// This will update the stats set of the array as a side effect.
 pub fn min_max(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Option<MinMaxResult>> {
     // Short-circuit using cached array statistics.
-    let cached_min = array
-        .statistics()
-        .get(Stat::Min)
-        .and_then(Precision::as_exact);
-    let cached_max = array
-        .statistics()
-        .get(Stat::Max)
-        .and_then(Precision::as_exact);
+    let cached_min = array.statistics().get(Stat::Min).as_exact();
+    let cached_max = array.statistics().get(Stat::Max).as_exact();
     if let Some((min, max)) = cached_min.zip(cached_max) {
         let non_nullable_dtype = array.dtype().as_nonnullable();
         return Ok(Some(MinMaxResult {
@@ -177,7 +171,7 @@ impl AggregateFnVTable for MinMax {
     }
 
     fn serialize(&self, _options: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
-        unimplemented!("MinMax is not yet serializable");
+        Ok(None)
     }
 
     fn return_dtype(&self, _options: &Self::Options, input_dtype: &DType) -> Option<DType> {
@@ -298,6 +292,7 @@ mod tests {
     use crate::aggregate_fn::EmptyOptions;
     use crate::aggregate_fn::fns::min_max::MinMax;
     use crate::aggregate_fn::fns::min_max::MinMaxResult;
+    use crate::aggregate_fn::fns::min_max::make_minmax_dtype;
     use crate::aggregate_fn::fns::min_max::min_max;
     use crate::arrays::BoolArray;
     use crate::arrays::ChunkedArray;
@@ -451,7 +446,7 @@ mod tests {
         let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
         let mut state = MinMax.empty_partial(&EmptyOptions, &dtype)?;
 
-        let struct_dtype = crate::aggregate_fn::fns::min_max::make_minmax_dtype(&dtype);
+        let struct_dtype = make_minmax_dtype(&dtype);
         let scalar1 = Scalar::struct_(
             struct_dtype.clone(),
             vec![Scalar::from(5i32), Scalar::from(15i32)],

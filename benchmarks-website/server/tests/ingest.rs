@@ -14,6 +14,7 @@ use serde_json::json;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
+use tokio::time::Duration;
 use vortex_bench_server::app::AppState;
 use vortex_bench_server::app::router;
 
@@ -55,6 +56,21 @@ impl Drop for Server {
     }
 }
 
+async fn wait_for_groups(client: &reqwest::Client, server: &Server) -> Result<Value> {
+    let mut last_len = 0usize;
+    for _ in 0..100 {
+        let resp = client.get(server.url("/api/groups")).send().await?;
+        assert_eq!(resp.status(), 200);
+        let body: Value = resp.json().await?;
+        last_len = body["groups"].as_array().context("groups is array")?.len();
+        if last_len > 0 {
+            return Ok(body);
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    anyhow::bail!("read model did not rebuild groups; last len {last_len}")
+}
+
 fn fixture_envelope() -> Value {
     let raw = include_str!("../fixtures/envelope.json");
     serde_json::from_str(raw).expect("fixture envelope is valid JSON")
@@ -90,6 +106,23 @@ async fn happy_path_then_idempotent_reingest() -> Result<()> {
         body["updated"].as_u64().context("updated is u64")? > 0,
         "re-emit must report at least one updated row"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn accepts_payloads_above_axum_default_body_limit() -> Result<()> {
+    let server = Server::start().await?;
+    let client = reqwest::Client::new();
+    let mut envelope = fixture_envelope();
+    envelope["commit"]["message"] = json!("x".repeat(3 * 1024 * 1024));
+
+    let resp = client
+        .post(server.url("/api/ingest"))
+        .bearer_auth(TOKEN)
+        .json(&envelope)
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 200);
     Ok(())
 }
 
@@ -256,9 +289,7 @@ async fn read_routes_serve_after_ingest() -> Result<()> {
         .send()
         .await?;
 
-    let resp = client.get(server.url("/api/groups")).send().await?;
-    assert_eq!(resp.status(), 200);
-    let body: Value = resp.json().await?;
+    let body = wait_for_groups(&client, &server).await?;
     let groups = body["groups"].as_array().context("groups is array")?;
     assert!(
         !groups.is_empty(),
@@ -310,6 +341,45 @@ async fn unknown_slug_is_404() -> Result<()> {
         resp.status() == 400 || resp.status() == 404,
         "got {}",
         resp.status()
+    );
+    Ok(())
+}
+
+/// Reads are served from the materialized read model. Ingest schedules a
+/// background rebuild and keeps the old generation live until the new one is
+/// ready.
+#[tokio::test]
+async fn read_model_rebuilds_after_ingest() -> Result<()> {
+    let server = Server::start().await?;
+    let client = reqwest::Client::new();
+
+    // Warm the cache against an empty DB.
+    let resp = client.get(server.url("/api/groups")).send().await?;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await?;
+    assert_eq!(
+        body["groups"].as_array().context("groups is array")?.len(),
+        0,
+        "groups should be empty before any ingest"
+    );
+
+    // Ingest some data. The handler invalidates fallback caches and schedules
+    // the materialized read-model rebuild after the commit.
+    let resp = client
+        .post(server.url("/api/ingest"))
+        .bearer_auth(TOKEN)
+        .json(&fixture_envelope())
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 200, "ingest should succeed");
+
+    // The old empty generation may be served briefly, but the rebuilt
+    // generation must become visible shortly after ingest.
+    let body = wait_for_groups(&client, &server).await?;
+    let groups = body["groups"].as_array().context("groups is array")?;
+    assert!(
+        !groups.is_empty(),
+        "groups must repopulate after the read-model rebuild"
     );
     Ok(())
 }

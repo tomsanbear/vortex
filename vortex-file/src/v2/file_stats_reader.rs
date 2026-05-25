@@ -32,6 +32,7 @@ use vortex_error::VortexResult;
 use vortex_layout::ArrayFuture;
 use vortex_layout::LayoutReader;
 use vortex_layout::LayoutReaderRef;
+use vortex_layout::SplitRange;
 use vortex_mask::Mask;
 use vortex_session::VortexSession;
 use vortex_utils::aliases::dash_map::DashMap;
@@ -131,7 +132,7 @@ impl StatsCatalog for FileStatsLayoutReader {
         let field_idx = self.struct_fields.find(field_name)?;
         let field_stats = self.file_stats.stats_sets().get(field_idx)?;
 
-        let stat_value = field_stats.get(stat)?.as_exact()?;
+        let stat_value = field_stats.get(stat).as_exact()?;
         let field_dtype = self.struct_fields.field_by_index(field_idx)?;
         let stat_dtype = stat.dtype(&field_dtype)?;
         let stat_scalar = Scalar::try_new(stat_dtype, Some(stat_value)).ok()?;
@@ -156,10 +157,10 @@ impl LayoutReader for FileStatsLayoutReader {
     fn register_splits(
         &self,
         field_mask: &[FieldMask],
-        row_range: &Range<u64>,
+        split_range: &SplitRange,
         splits: &mut BTreeSet<u64>,
     ) -> VortexResult<()> {
-        self.child.register_splits(field_mask, row_range, splits)
+        self.child.register_splits(field_mask, split_range, splits)
     }
 
     fn pruning_evaluation(

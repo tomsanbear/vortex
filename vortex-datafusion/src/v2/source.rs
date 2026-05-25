@@ -72,13 +72,15 @@ use std::fmt;
 use std::fmt::Formatter;
 use std::sync::Arc;
 
-use arrow_schema::DataType;
+use arrow_schema::Field;
 use arrow_schema::Schema;
 use arrow_schema::SchemaRef;
 use datafusion_common::ColumnStatistics;
 use datafusion_common::DataFusionError;
 use datafusion_common::Result as DFResult;
 use datafusion_common::Statistics;
+use datafusion_common::arrow::array::AsArray;
+use datafusion_common::arrow::array::RecordBatch;
 use datafusion_common::stats::Precision as DFPrecision;
 use datafusion_datasource::source::DataSource;
 use datafusion_execution::SendableRecordBatchStream;
@@ -97,7 +99,7 @@ use futures::StreamExt;
 use futures::TryStreamExt;
 use futures::future::try_join_all;
 use vortex::array::VortexSessionExecute;
-use vortex::array::arrow::ArrowArrayExecutor;
+use vortex::array::arrow::ArrowSessionExt;
 use vortex::dtype::DType;
 use vortex::dtype::FieldPath;
 use vortex::dtype::Nullability;
@@ -209,13 +211,11 @@ impl VortexDataSourceBuilder {
         // Resolve the Arrow schema
         let mut arrow_schema = match self.arrow_schema {
             Some(schema) => schema,
-            None => {
-                let data_type = self.data_source.dtype().to_arrow_dtype()?;
-                let DataType::Struct(fields) = data_type else {
-                    vortex_bail!("Expected a struct-like DataType, found {}", data_type);
-                };
-                Arc::new(Schema::new(fields))
-            }
+            None => Arc::new(
+                self.session
+                    .arrow()
+                    .to_arrow_schema(self.data_source.dtype())?,
+            ),
         };
 
         // Apply any selection and create a projection expression.
@@ -396,6 +396,11 @@ impl DataSource for VortexDataSource {
 
         let data_source = Arc::clone(&self.data_source);
         let projected_schema = Arc::clone(&self.projected_schema);
+        let projected_target_field = Arc::new(Field::new_struct(
+            "",
+            projected_schema.fields().clone(),
+            false,
+        ));
         let session = self.session.clone();
         let num_partitions = self.num_partitions;
 
@@ -427,10 +432,17 @@ impl DataSource for VortexDataSource {
                 .try_flatten_unordered(Some(num_partitions * 2))
                 .map(move |result| {
                     let session = session.clone();
-                    let schema = Arc::clone(&projected_schema);
+                    let target_field = Arc::clone(&projected_target_field);
                     handle.spawn_cpu(move || {
                         let mut ctx = session.create_execution_ctx();
-                        result.and_then(|chunk| chunk.execute_record_batch(&schema, &mut ctx))
+                        result.and_then(|chunk| {
+                            let arrow = session.arrow().execute_arrow(
+                                chunk,
+                                Some(target_field.as_ref()),
+                                &mut ctx,
+                            )?;
+                            Ok(RecordBatch::from(arrow.as_struct().clone()))
+                        })
                     })
                 })
                 .buffered(num_partitions)
@@ -500,10 +512,10 @@ impl DataSource for VortexDataSource {
     fn partition_statistics(&self, _partition: Option<usize>) -> DFResult<Statistics> {
         // FIXME(ngates): this should be adjusted based on filters. See DuckDB for heuristics,
         //  and in the future, store the selectivity stats in the session.
-        let num_rows = estimate_to_df_precision(self.data_source.row_count().as_ref());
+        let num_rows = estimate_to_df_precision(&self.data_source.row_count());
 
         // FIXME(ngates): byte size should be adjusted for the initial projection...
-        let total_byte_size = estimate_to_df_precision(self.data_source.byte_size().as_ref());
+        let total_byte_size = estimate_to_df_precision(&self.data_source.byte_size());
 
         // Column statistics must match the output schema (leftover_schema), which may differ
         // from the initial schema after try_swapping_with_projection adds computed columns.
@@ -557,15 +569,12 @@ impl DataSource for VortexDataSource {
         let scan_dtype = scan_projection
             .return_dtype(self.data_source.dtype())
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let scan_arrow_type = scan_dtype
-            .to_arrow_dtype()
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let DataType::Struct(scan_fields) = scan_arrow_type else {
-            return Err(DataFusionError::Internal(
-                "Scan projection must produce a struct type".to_string(),
-            ));
-        };
-        let scan_output_schema = Arc::new(Schema::new(scan_fields));
+        let scan_output_schema = Arc::new(
+            self.session
+                .arrow()
+                .to_arrow_schema(&scan_dtype)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?,
+        );
 
         // Remap the leftover column references to match the scan output schema.
         let leftover_projection = leftover_projection
@@ -654,12 +663,10 @@ impl DataSource for VortexDataSource {
 /// [`DataFusionPrecision`].
 ///
 /// [`DataFusionPrecision`]: datafusion_common::stats::Precision
-fn estimate_to_df_precision(est: Option<&Precision<u64>>) -> DFPrecision<usize> {
+fn estimate_to_df_precision(est: &Precision<u64>) -> DFPrecision<usize> {
     match est {
-        Some(Precision::Exact(v)) => DFPrecision::Exact(usize::try_from(*v).unwrap_or(usize::MAX)),
-        Some(Precision::Inexact(v)) => {
-            DFPrecision::Inexact(usize::try_from(*v).unwrap_or(usize::MAX))
-        }
-        None => DFPrecision::Absent,
+        Precision::Exact(v) => DFPrecision::Exact(usize::try_from(*v).unwrap_or(usize::MAX)),
+        Precision::Inexact(v) => DFPrecision::Inexact(usize::try_from(*v).unwrap_or(usize::MAX)),
+        Precision::Absent => DFPrecision::Absent,
     }
 }

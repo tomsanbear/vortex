@@ -13,12 +13,12 @@ use arrow_array::RecordBatch;
 use arrow_array::cast::AsArray;
 use arrow_array::ffi_stream::FFI_ArrowArrayStream;
 use arrow_schema::ArrowError;
-use arrow_schema::DataType;
+use arrow_schema::Field;
 use futures::StreamExt;
 use vortex::array::ArrayRef;
 use vortex::array::ExecutionCtx;
 use vortex::array::VortexSessionExecute;
-use vortex::array::arrow::ArrowArrayExecutor;
+use vortex::array::arrow::ArrowSessionExt;
 use vortex::array::expr::stats::Precision;
 use vortex::array::stream::SendableArrayStream;
 use vortex::buffer::Buffer;
@@ -194,17 +194,17 @@ fn scan_request(opts: *const vx_scan_options) -> VortexResult<ScanRequest> {
     })
 }
 
-fn write_estimate<T: Into<u64>>(estimate: Option<Precision<T>>, out: &mut vx_estimate) {
+fn write_estimate<T: Into<u64>>(estimate: Precision<T>, out: &mut vx_estimate) {
     match estimate {
-        Some(Precision::Exact(value)) => {
+        Precision::Exact(value) => {
             out.r#type = vx_estimate_type::VX_ESTIMATE_EXACT;
             out.estimate = value.into();
         }
-        Some(Precision::Inexact(value)) => {
+        Precision::Inexact(value) => {
             out.r#type = vx_estimate_type::VX_ESTIMATE_INEXACT;
             out.estimate = value.into();
         }
-        None => {
+        Precision::Absent => {
             out.r#type = vx_estimate_type::VX_ESTIMATE_UNKNOWN;
         }
     }
@@ -234,13 +234,9 @@ pub unsafe extern "C-unwind" fn vx_data_source_scan(
         RUNTIME.block_on(async {
             let scan = vx_data_source::as_ref(data_source).scan(request).await?;
             if !estimate.is_null() {
-                write_estimate(
-                    scan.partition_count().map(|x| match x {
-                        Precision::Exact(v) => Precision::Exact(v as u64),
-                        Precision::Inexact(v) => Precision::Inexact(v as u64),
-                    }),
-                    unsafe { &mut *estimate },
-                );
+                write_estimate(scan.partition_count().map(|v| v as u64), unsafe {
+                    &mut *estimate
+                });
             }
             Ok(vx_scan::new(VxScan::Pending(scan)))
         })
@@ -362,14 +358,16 @@ pub unsafe extern "C-unwind" fn vx_partition_scan_arrow(
 
         let schema = dtype.to_arrow_schema()?;
         let schema = Arc::new(schema);
-        let data_type = DataType::Struct(schema.fields().clone());
+        let target = Field::new_struct("", schema.fields().clone(), false);
 
         let session = vx_session::as_ref(session);
 
         let on_chunk = move |chunk: VortexResult<ArrayRef>| -> VortexResult<RecordBatch> {
             let chunk: ArrayRef = chunk?;
             let mut ctx: ExecutionCtx = session.create_execution_ctx();
-            let arrow = chunk.execute_arrow(Some(&data_type), &mut ctx)?;
+            let arrow = session
+                .arrow()
+                .execute_arrow(chunk, Some(&target), &mut ctx)?;
             Ok(RecordBatch::from(arrow.as_struct().clone()))
         };
 

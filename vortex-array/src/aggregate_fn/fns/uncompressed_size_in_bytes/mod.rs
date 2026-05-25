@@ -63,9 +63,7 @@ pub fn uncompressed_size_in_bytes(array: &ArrayRef, ctx: &mut ExecutionCtx) -> V
 }
 
 fn uncompressed_size_in_bytes_u64(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<u64> {
-    if let Some(Precision::Exact(size_scalar)) =
-        array.statistics().get(Stat::UncompressedSizeInBytes)
-    {
+    if let Precision::Exact(size_scalar) = array.statistics().get(Stat::UncompressedSizeInBytes) {
         return u64::try_from(&size_scalar)
             .map_err(|e| vortex_err!("Failed to convert uncompressed size stat to u64: {e}"));
     }
@@ -150,26 +148,6 @@ impl AggregateFnVTable for UncompressedSizeInBytes {
         false
     }
 
-    fn try_accumulate(
-        &self,
-        partial: &mut Self::Partial,
-        batch: &ArrayRef,
-        _ctx: &mut ExecutionCtx,
-    ) -> VortexResult<bool> {
-        let Some(Precision::Exact(size_scalar)) =
-            batch.statistics().get(Stat::UncompressedSizeInBytes)
-        else {
-            return Ok(false);
-        };
-
-        let size = u64::try_from(&size_scalar)
-            .map_err(|e| vortex_err!("Failed to convert uncompressed size stat to u64: {e}"))?;
-        *partial = partial
-            .checked_add(size)
-            .ok_or_else(|| vortex_err!("uncompressed size in bytes overflowed u64"))?;
-        Ok(true)
-    }
-
     fn accumulate(
         &self,
         partial: &mut Self::Partial,
@@ -240,12 +218,13 @@ pub(crate) fn constant_uncompressed_size_in_bytes(
             array.len(),
             array.scalar().as_binary().value().map(|value| value.len()),
         )?,
-        DType::Variant(_) => {
-            vortex_bail!("UncompressedSizeInBytes is not supported for Variant arrays")
-        }
-        DType::Struct(..) | DType::List(..) | DType::FixedSizeList(..) | DType::Extension(_) => {
+        DType::List(..) | DType::FixedSizeList(..) | DType::Struct(..) | DType::Extension(_) => {
             let canonical = array.array().clone().execute::<Canonical>(ctx)?;
             return canonical_uncompressed_size_in_bytes(&canonical, ctx);
+        }
+        DType::Union(..) => todo!("TODO(connor)[Union]: unimplemented"),
+        DType::Variant(_) => {
+            vortex_bail!("UncompressedSizeInBytes is not supported for Variant arrays")
         }
     };
 
@@ -287,22 +266,23 @@ fn checked_len_mul(len: usize, width: usize, name: &str) -> VortexResult<u64> {
 
 fn supports_uncompressed_size_in_bytes(dtype: &DType) -> bool {
     match dtype {
-        DType::List(element_dtype, _) | DType::FixedSizeList(element_dtype, ..) => {
-            supports_uncompressed_size_in_bytes(element_dtype)
-        }
-        DType::Struct(fields, _) => fields
-            .fields()
-            .all(|field| supports_uncompressed_size_in_bytes(&field)),
-        DType::Extension(ext_dtype) => {
-            supports_uncompressed_size_in_bytes(ext_dtype.storage_dtype())
-        }
-        DType::Variant(_) => false,
         DType::Null
         | DType::Bool(_)
         | DType::Primitive(..)
         | DType::Decimal(..)
         | DType::Utf8(_)
         | DType::Binary(_) => true,
+        DType::List(element_dtype, _) | DType::FixedSizeList(element_dtype, ..) => {
+            supports_uncompressed_size_in_bytes(element_dtype)
+        }
+        DType::Struct(fields, _) => fields
+            .fields()
+            .all(|field| supports_uncompressed_size_in_bytes(&field)),
+        DType::Union(_) => todo!("TODO(connor)[Union]: unimplemented"),
+        DType::Variant(_) => false,
+        DType::Extension(ext_dtype) => {
+            supports_uncompressed_size_in_bytes(ext_dtype.storage_dtype())
+        }
     }
 }
 
@@ -555,7 +535,7 @@ mod tests {
     #[test]
     fn variant_stat_is_unsupported() -> VortexResult<()> {
         let child = ConstantArray::new(Scalar::variant(Scalar::from(42i32)), 3).into_array();
-        let array = VariantArray::new(child).into_array();
+        let array = VariantArray::try_new(child, None)?.into_array();
         let mut ctx = LEGACY_SESSION.create_execution_ctx();
 
         assert_eq!(
@@ -615,7 +595,7 @@ mod tests {
 
         assert_eq!(
             array.statistics().get(Stat::UncompressedSizeInBytes),
-            Some(Precision::exact(u64::try_from(size)?))
+            Precision::exact(u64::try_from(size)?)
         );
         Ok(())
     }

@@ -188,10 +188,13 @@ impl Scalar {
             DType::Utf8(_) => value.as_utf8().is_empty(),
             DType::Binary(_) => value.as_binary().is_empty(),
             DType::List(..) => value.as_list().is_empty(),
+            // TODO(connor): This seems wrong...
             DType::FixedSizeList(_, list_size, _) => value.as_list().len() == *list_size as usize,
+            // TODO(connor): This also seems wrong...
             DType::Struct(struct_fields, _) => value.as_list().len() == struct_fields.nfields(),
-            DType::Extension(_) => self.as_extension().to_storage_scalar().is_zero()?,
+            DType::Union(..) => todo!("TODO(connor)[Union]: unimplemented"),
             DType::Variant(_) => self.as_variant().is_zero()?,
+            DType::Extension(_) => self.as_extension().to_storage_scalar().is_zero()?,
         };
 
         Some(is_zero)
@@ -248,18 +251,19 @@ impl Scalar {
             DType::Binary(_) => self
                 .value()
                 .map_or_else(|| 0, |value| value.as_binary().len()),
-            DType::Struct(..) => self
-                .as_struct()
-                .fields_iter()
-                .map(|fields| fields.into_iter().map(|f| f.approx_nbytes()).sum::<usize>())
-                .unwrap_or_default(),
             DType::List(..) | DType::FixedSizeList(..) => self
                 .as_list()
                 .elements()
                 .map(|fields| fields.into_iter().map(|f| f.approx_nbytes()).sum::<usize>())
                 .unwrap_or_default(),
-            DType::Extension(_) => self.as_extension().to_storage_scalar().approx_nbytes(),
+            DType::Struct(..) => self
+                .as_struct()
+                .fields_iter()
+                .map(|fields| fields.into_iter().map(|f| f.approx_nbytes()).sum::<usize>())
+                .unwrap_or_default(),
+            DType::Union(..) => todo!("TODO(connor)[Union]: unimplemented"),
             DType::Variant(_) => self.as_variant().value().map_or(0, Scalar::approx_nbytes),
+            DType::Extension(_) => self.as_extension().to_storage_scalar().approx_nbytes(),
         }
     }
 }

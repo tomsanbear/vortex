@@ -31,7 +31,7 @@ use crate::executor::CudaArrayExt;
 use crate::executor::CudaExecute;
 use crate::executor::CudaExecutionCtx;
 use crate::kernel::patches::build_gpu_patches;
-use crate::kernel::patches::types::load_patches;
+use crate::kernel::patches::types::load_device_patches;
 
 /// CUDA decoder for ALP (Adaptive Lossless floating-Point) decompression.
 #[derive(Debug)]
@@ -91,10 +91,10 @@ where
 
     // Patch validity does not need to be scattered: the ALP encoder strips null
     // positions from the exception list, so patches only exist at valid
-    // positions. load_patches additionally rejects patches without
+    // positions. load_device_patches additionally rejects patches without
     // chunk_offsets (required by the fused kernel's PatchesCursor).
     let device_patches = if let Some(patches) = array.patches() {
-        Some(load_patches(&patches, ctx).await?)
+        Some(load_device_patches(&patches, ctx).await?)
     } else {
         None
     };
@@ -137,6 +137,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::f32;
+    use std::f64;
+
     use vortex::array::IntoArray;
     use vortex::array::LEGACY_SESSION;
     use vortex::array::VortexSessionExecute;
@@ -160,8 +163,8 @@ mod tests {
 
     /// Irrational values ALP cannot encode losslessly, guaranteed to land
     /// in the exception list on round-trip through `alp_encode`.
-    const UNENCODABLE: f64 = std::f64::consts::PI;
-    const UNENCODABLE_F32: f32 = std::f32::consts::PI;
+    const UNENCODABLE: f64 = f64::consts::PI;
+    const UNENCODABLE_F32: f32 = f32::consts::PI;
 
     /// Small manually-constructed ALP array with patches. Exercises the
     /// custom-construction path (as opposed to going through `alp_encode`).

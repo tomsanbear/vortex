@@ -7,16 +7,19 @@
 
 use std::env;
 use std::fs;
+use std::os::unix::fs::symlink;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::exit;
 
 use bindgen::Abi;
+use bindgen::callbacks::ParseCallbacks;
 
 const DUCKDB_RELEASES_URL: &str = "https://github.com/duckdb/duckdb/releases/download";
 const DUCKDB_SOURCE_RELEASE_URL: &str = "https://github.com/duckdb/duckdb/archive/refs/tags";
 const DUCKDB_SOURCE_COMMIT_URL: &str = "https://github.com/duckdb/duckdb/archive";
+const DEFAULT_DUCKDB_VERSION: &str = "1.5.3";
 
 const BUILD_ARTIFACTS: [&str; 3] = ["libduckdb.dylib", "libduckdb.so", "libduckdb_static.a"];
 
@@ -42,6 +45,26 @@ const SOURCE_FILES: [&str; 17] = [
 
 const DOWNLOAD_MAX_RETRIES: i32 = 3;
 const DOWNLOAD_TIMEOUT: u64 = 90;
+
+#[derive(Debug)]
+struct BindgenCargoCallbacks;
+
+impl ParseCallbacks for BindgenCargoCallbacks {
+    fn read_env_var(&self, key: &str) {
+        println!("cargo:rerun-if-env-changed={key}");
+    }
+
+    fn header_file(&self, filename: &str) {
+        println!("cargo:rerun-if-changed={filename}");
+    }
+
+    fn include_file(&self, _filename: &str) {
+        // We do not want to let bindgen add DuckDB headers from OUT_DIR to Cargo's fingerprint.
+        // Those files are extracted during this build script, so their mtimes are newer than
+        // Cargo's build-script output timestamp and would force one extra
+        // rebuild after a clean build.
+    }
+}
 
 #[derive(Debug, Clone)]
 enum DuckDBVersion {
@@ -289,6 +312,7 @@ fn c2rust(crate_dir: &Path, duckdb_include_dir: &Path) {
         .raw_line("#![allow(non_camel_case_types)]")
         .raw_line("#![allow(non_upper_case_globals)]")
         .raw_line("#![allow(non_snake_case)]")
+        .raw_line("#![allow(clippy::absolute_paths)]")
         .raw_line("#![allow(clippy::suspicious_doc_comments)]")
         .raw_line("#![allow(clippy::enum_variant_names)]")
         // Add the #[must_use] attribute to FFI functions that return results.
@@ -303,9 +327,7 @@ fn c2rust(crate_dir: &Path, duckdb_include_dir: &Path) {
         .clang_arg(format!("-I{}", duckdb_include_dir.display()))
         .clang_arg(format!("-I{}", crate_dir.join("cpp/include").display()))
         .generate_comments(true)
-        // Tell cargo to invalidate the built crate whenever any of the
-        // included header files changed.
-        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+        .parse_callbacks(Box::new(BindgenCargoCallbacks))
         .generate();
 
     let bindings = match bindings {
@@ -336,7 +358,6 @@ fn cpp(duckdb_include_dir: &Path) {
         .include("cpp/include")
         .files(SOURCE_FILES)
         .compile("vortex-duckdb-extras");
-    // bindgen generates rerun-if-changed for .h/.hpp files
     for e in SOURCE_FILES {
         println!("cargo:rerun-if-changed={e}");
     }
@@ -382,7 +403,7 @@ fn main() {
     // e.g. reordering fields in C++ structs.
     let version = env::var("DUCKDB_VERSION")
         // You can also change this version to a commit hash
-        .unwrap_or_else(|_| "1.5.2".to_owned());
+        .unwrap_or_else(|_| DEFAULT_DUCKDB_VERSION.to_owned());
     let version = DuckDBVersion::from(&version);
     match &version {
         DuckDBVersion::Release(v) => println!("cargo:info=Using DuckDB release version: {v}"),
@@ -430,7 +451,7 @@ fn main() {
 
     drop(fs::remove_file(&duckdb_dir));
     drop(fs::remove_dir_all(&duckdb_dir));
-    std::os::unix::fs::symlink(&source_dir, &duckdb_dir).unwrap();
+    symlink(&source_dir, &duckdb_dir).unwrap();
 
     let has_debug_env =
         env::var("VX_DUCKDB_DEBUG").is_ok_and(|v| matches!(v.as_str(), "1" | "true"));
@@ -447,6 +468,7 @@ fn main() {
     };
 
     let duckdb_include_dir = inner_dir.join("src").join("include");
+    println!("cargo:rerun-if-changed=cpp/include");
     c2rust(&crate_dir, &duckdb_include_dir);
     cpp(&duckdb_include_dir);
     rust2c(&crate_dir);
