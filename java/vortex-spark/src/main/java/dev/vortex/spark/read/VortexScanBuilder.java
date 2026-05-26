@@ -119,7 +119,12 @@ public final class VortexScanBuilder
         // Allow empty columns for operations like count() that don't need actual column data
         // If no columns are specified, we'll read the minimal schema needed
 
-        return new VortexScan(paths, List.copyOf(this.tableColumns), List.copyOf(this.readColumns), pushedPredicates, this.formatOptions);
+        return new VortexScan(
+                paths,
+                List.copyOf(this.tableColumns),
+                List.copyOf(this.readColumns),
+                pushedPredicates,
+                this.formatOptions);
     }
 
     /**

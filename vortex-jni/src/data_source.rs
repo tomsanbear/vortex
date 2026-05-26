@@ -265,9 +265,9 @@ pub extern "system" fn Java_dev_vortex_jni_NativeDataSource_byteSize(
     try_or_throw(&mut env, |env| {
         let ds = unsafe { NativeDataSource::from_ptr(pointer) };
         let (bytes, precision) = match ds.inner.byte_size() {
-            Some(Precision::Exact(b)) => (b as jlong, 2),
-            Some(Precision::Inexact(b)) => (b as jlong, 1),
-            None => (0, 0),
+            Precision::Exact(b) => (b as jlong, 2),
+            Precision::Inexact(b) => (b as jlong, 1),
+            Precision::Absent => (0, 0),
         };
         out.set_region(env, 0, &[bytes, precision])?;
         Ok(())

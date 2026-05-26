@@ -249,10 +249,10 @@ impl DataSource for MultiLayoutDataSource {
         }
     }
 
-    fn byte_size(&self) -> Option<Precision<u64>> {
+    fn byte_size(&self) -> Precision<u64> {
         let total_count = self.children.len() as u64;
         if total_count == 0 {
-            return Some(Precision::exact(0u64));
+            return Precision::exact(0u64);
         }
 
         let mut sum: u64 = 0;
@@ -265,15 +265,15 @@ impl DataSource for MultiLayoutDataSource {
         }
 
         if known_count == 0 {
-            return None;
+            return Precision::Absent;
         }
 
         if known_count == total_count {
-            Some(Precision::exact(sum))
+            Precision::exact(sum)
         } else {
             let avg = sum / known_count;
             let extrapolated = avg.saturating_mul(total_count);
-            Some(Precision::inexact(extrapolated))
+            Precision::inexact(extrapolated)
         }
     }
 
