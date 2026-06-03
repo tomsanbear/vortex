@@ -13,7 +13,8 @@ use vortex_array::dtype::UnsignedPType;
 use vortex_array::match_each_integer_ptype;
 use vortex_array::match_each_unsigned_integer_ptype;
 use vortex_array::validity::Validity;
-use vortex_buffer::{Buffer, BufferMut};
+use vortex_buffer::Buffer;
+use vortex_buffer::BufferMut;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_mask::Mask;
@@ -91,8 +92,7 @@ fn take_indices_unchecked_with_mask<T: AsPrimitive<usize>>(
 
     let physical_indices = match_each_unsigned_integer_ptype!(ends.ptype(), |I| {
         let end_slices = ends.as_slice::<I>();
-        let physical_indices =
-            physical_indices(end_slices, array.offset(), indices, validity_mask);
+        let physical_indices = physical_indices(end_slices, array.offset(), indices, validity_mask);
 
         PrimitiveArray::new(physical_indices, validity.clone())
     });
