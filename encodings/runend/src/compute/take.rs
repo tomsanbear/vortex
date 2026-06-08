@@ -17,6 +17,7 @@ use vortex_buffer::Buffer;
 use vortex_buffer::BufferMut;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
+use vortex_mask::AllOr;
 use vortex_mask::Mask;
 
 use crate::RunEnd;
@@ -26,10 +27,6 @@ const SORTED_LINEAR_RUNS_PER_INDEX_THRESHOLD: usize = 16;
 const UNSORTED_LINEAR_RUNS_PER_INDEX_THRESHOLD: usize = 4;
 
 impl TakeExecute for RunEnd {
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "index cast to usize inside macro"
-    )]
     fn take(
         array: ArrayView<'_, Self>,
         indices: &ArrayRef,
@@ -39,35 +36,42 @@ impl TakeExecute for RunEnd {
         let indices_validity = primitive_indices.validity()?;
         let indices_mask = indices_validity.execute_mask(primitive_indices.len(), ctx)?;
 
-        let checked_indices = match_each_integer_ptype!(primitive_indices.ptype(), |P| {
-            primitive_indices
-                .as_slice::<P>()
-                .iter()
-                .copied()
-                .enumerate()
-                .map(|(idx_pos, idx)| {
-                    if !indices_mask.value(idx_pos) {
-                        return Ok(0);
-                    }
-
-                    let usize_idx = idx as usize;
-                    if usize_idx >= array.len() {
-                        vortex_bail!(OutOfBounds: usize_idx, 0, array.len());
-                    }
-                    Ok(usize_idx)
-                })
-                .collect::<VortexResult<Vec<_>>>()?
+        let taken = match_each_integer_ptype!(primitive_indices.ptype(), |P| {
+            take_indices_checked_with_mask(
+                array,
+                primitive_indices.as_slice::<P>(),
+                &indices_validity,
+                &indices_mask,
+                ctx,
+            )?
         });
 
-        take_indices_unchecked_with_mask(
-            array,
-            &checked_indices,
-            &indices_validity,
-            &indices_mask,
-            ctx,
-        )
-        .map(Some)
+        Ok(Some(taken))
     }
+}
+
+fn take_indices_checked_with_mask<T: AsPrimitive<usize>>(
+    array: ArrayView<'_, RunEnd>,
+    indices: &[T],
+    validity: &Validity,
+    validity_mask: &Mask,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<ArrayRef> {
+    let ends = array.ends().clone().execute::<PrimitiveArray>(ctx)?;
+
+    let physical_indices = match_each_unsigned_integer_ptype!(ends.ptype(), |I| {
+        let end_slices = ends.as_slice::<I>();
+        physical_indices(
+            end_slices,
+            array.offset(),
+            indices,
+            validity_mask,
+            Some(array.len()),
+        )
+        .map(|physical_indices| PrimitiveArray::new(physical_indices, validity.clone()))
+    })?;
+
+    array.values().take(physical_indices.into_array())
 }
 
 /// Perform a take operation on a RunEndArray.
@@ -92,10 +96,9 @@ fn take_indices_unchecked_with_mask<T: AsPrimitive<usize>>(
 
     let physical_indices = match_each_unsigned_integer_ptype!(ends.ptype(), |I| {
         let end_slices = ends.as_slice::<I>();
-        let physical_indices = physical_indices(end_slices, array.offset(), indices, validity_mask);
-
-        PrimitiveArray::new(physical_indices, validity.clone())
-    });
+        physical_indices(end_slices, array.offset(), indices, validity_mask, None)
+            .map(|physical_indices| PrimitiveArray::new(physical_indices, validity.clone()))
+    })?;
 
     array.values().take(physical_indices.into_array())
 }
@@ -105,21 +108,48 @@ fn physical_indices<I, T>(
     offset: usize,
     indices: &[T],
     validity_mask: &Mask,
+    array_len: Option<usize>,
+) -> VortexResult<Buffer<u64>>
+where
+    I: UnsignedPType,
+    T: AsPrimitive<usize>,
+{
+    let stats = valid_indices_stats(indices, validity_mask, array_len)?;
+
+    Ok(physical_indices_with_stats(
+        ends,
+        offset,
+        indices,
+        validity_mask,
+        stats,
+    ))
+}
+
+#[derive(Clone, Copy)]
+struct ValidIndicesStats {
+    count: usize,
+    sorted: bool,
+}
+
+fn physical_indices_with_stats<I, T>(
+    ends: &[I],
+    offset: usize,
+    indices: &[T],
+    validity_mask: &Mask,
+    stats: ValidIndicesStats,
 ) -> Buffer<u64>
 where
     I: UnsignedPType,
     T: AsPrimitive<usize>,
 {
-    let (valid_count, valid_indices_sorted) = valid_indices_stats(indices, validity_mask);
-
-    if valid_count == 0 {
+    if stats.count == 0 {
         return Buffer::zeroed(indices.len());
     }
 
-    if valid_indices_sorted
+    if stats.sorted
         && prefer_linear_scan(
             ends.len(),
-            valid_count,
+            stats.count,
             SORTED_LINEAR_RUNS_PER_INDEX_THRESHOLD,
         )
     {
@@ -128,10 +158,10 @@ where
 
     if prefer_linear_scan(
         ends.len(),
-        valid_count,
+        stats.count,
         UNSORTED_LINEAR_RUNS_PER_INDEX_THRESHOLD,
     ) {
-        return physical_indices_linear_unsorted(ends, offset, indices, validity_mask, valid_count);
+        return physical_indices_linear_unsorted(ends, offset, indices, validity_mask, stats.count);
     }
 
     physical_indices_binary(ends, offset, indices, validity_mask)
@@ -140,25 +170,67 @@ where
 fn valid_indices_stats<T: AsPrimitive<usize>>(
     indices: &[T],
     validity_mask: &Mask,
-) -> (usize, bool) {
-    let mut valid_count = 0;
+    array_len: Option<usize>,
+) -> VortexResult<ValidIndicesStats> {
+    debug_assert_eq!(indices.len(), validity_mask.len());
+
+    match validity_mask.bit_buffer() {
+        AllOr::All => valid_indices_stats_all(indices, array_len),
+        AllOr::None => Ok(ValidIndicesStats {
+            count: 0,
+            sorted: true,
+        }),
+        AllOr::Some(validity) => valid_indices_stats_masked(indices, validity.iter(), array_len),
+    }
+}
+
+fn valid_indices_stats_all<T: AsPrimitive<usize>>(
+    indices: &[T],
+    array_len: Option<usize>,
+) -> VortexResult<ValidIndicesStats> {
     let mut previous_idx = None;
     let mut sorted = true;
 
-    for (idx_pos, idx) in indices.iter().enumerate() {
-        if !validity_mask.value(idx_pos) {
+    for idx in indices {
+        let idx = maybe_check_index(idx.as_(), array_len)?;
+        if previous_idx.is_some_and(|previous_idx| previous_idx > idx) {
+            sorted = false;
+            if array_len.is_none() {
+                break;
+            }
+        }
+        previous_idx = Some(idx);
+    }
+
+    Ok(ValidIndicesStats {
+        count: indices.len(),
+        sorted,
+    })
+}
+
+fn valid_indices_stats_masked<T: AsPrimitive<usize>>(
+    indices: &[T],
+    is_valid: impl Iterator<Item = bool>,
+    array_len: Option<usize>,
+) -> VortexResult<ValidIndicesStats> {
+    let mut count = 0;
+    let mut previous_idx = None;
+    let mut sorted = true;
+
+    for (is_valid, idx) in is_valid.zip(indices.iter()) {
+        if !is_valid {
             continue;
         }
 
-        let idx = idx.as_();
+        let idx = maybe_check_index(idx.as_(), array_len)?;
         if previous_idx.is_some_and(|previous_idx| previous_idx > idx) {
             sorted = false;
         }
         previous_idx = Some(idx);
-        valid_count += 1;
+        count += 1;
     }
 
-    (valid_count, sorted)
+    Ok(ValidIndicesStats { count, sorted })
 }
 
 fn prefer_linear_scan(
@@ -167,6 +239,20 @@ fn prefer_linear_scan(
     runs_per_index_threshold: usize,
 ) -> bool {
     ends_len <= valid_count.saturating_mul(runs_per_index_threshold)
+}
+
+fn check_index(index: usize, array_len: usize) -> VortexResult<usize> {
+    if index >= array_len {
+        vortex_bail!(OutOfBounds: index, 0, array_len);
+    }
+    Ok(index)
+}
+
+fn maybe_check_index(index: usize, array_len: Option<usize>) -> VortexResult<usize> {
+    match array_len {
+        Some(array_len) => check_index(index, array_len),
+        None => Ok(index),
+    }
 }
 
 fn physical_indices_linear_sorted<I, T>(
@@ -182,14 +268,26 @@ where
     let mut physical_indices = BufferMut::zeroed(indices.len());
     let mut run_idx = 0;
 
-    for (idx_pos, idx) in indices.iter().enumerate() {
-        if !validity_mask.value(idx_pos) {
-            continue;
+    match validity_mask.bit_buffer() {
+        AllOr::All => {
+            for (idx_pos, idx) in indices.iter().enumerate() {
+                let logical_idx = idx.as_() + offset;
+                advance_run(ends, &mut run_idx, logical_idx);
+                physical_indices[idx_pos] = run_idx as u64;
+            }
         }
+        AllOr::None => {}
+        AllOr::Some(validity) => {
+            for (idx_pos, (is_valid, idx)) in validity.iter().zip(indices.iter()).enumerate() {
+                if !is_valid {
+                    continue;
+                }
 
-        let logical_idx = idx.as_() + offset;
-        advance_run(ends, &mut run_idx, logical_idx);
-        physical_indices[idx_pos] = run_idx as u64;
+                let logical_idx = idx.as_() + offset;
+                advance_run(ends, &mut run_idx, logical_idx);
+                physical_indices[idx_pos] = run_idx as u64;
+            }
+        }
     }
 
     physical_indices.freeze()
@@ -207,9 +305,22 @@ where
     T: AsPrimitive<usize>,
 {
     let mut pairs = Vec::with_capacity(valid_count);
-    for (idx_pos, idx) in indices.iter().enumerate() {
-        if validity_mask.value(idx_pos) {
-            pairs.push((idx.as_(), idx_pos));
+    match validity_mask.bit_buffer() {
+        AllOr::All => {
+            pairs.extend(
+                indices
+                    .iter()
+                    .enumerate()
+                    .map(|(idx_pos, idx)| (idx.as_(), idx_pos)),
+            );
+        }
+        AllOr::None => return Buffer::zeroed(indices.len()),
+        AllOr::Some(validity) => {
+            for (idx_pos, (is_valid, idx)) in validity.iter().zip(indices.iter()).enumerate() {
+                if is_valid {
+                    pairs.push((idx.as_(), idx_pos));
+                }
+            }
         }
     }
     pairs.sort_unstable();
@@ -238,13 +349,24 @@ where
 {
     let mut physical_indices = BufferMut::zeroed(indices.len());
 
-    for (idx_pos, idx) in indices.iter().enumerate() {
-        if !validity_mask.value(idx_pos) {
-            continue;
+    match validity_mask.bit_buffer() {
+        AllOr::All => {
+            for (idx_pos, idx) in indices.iter().enumerate() {
+                let logical_idx = idx.as_() + offset;
+                physical_indices[idx_pos] = physical_index_binary(ends, logical_idx) as u64;
+            }
         }
+        AllOr::None => {}
+        AllOr::Some(validity) => {
+            for (idx_pos, (is_valid, idx)) in validity.iter().zip(indices.iter()).enumerate() {
+                if !is_valid {
+                    continue;
+                }
 
-        let logical_idx = idx.as_() + offset;
-        physical_indices[idx_pos] = physical_index_binary(ends, logical_idx) as u64;
+                let logical_idx = idx.as_() + offset;
+                physical_indices[idx_pos] = physical_index_binary(ends, logical_idx) as u64;
+            }
+        }
     }
 
     physical_indices.freeze()
@@ -358,6 +480,36 @@ mod tests {
         let taken = ree_array().take(indices.into_array()).unwrap();
 
         let expected = PrimitiveArray::from_option_iter([Some(1i32), None]);
+        assert_arrays_eq!(taken, expected.into_array());
+    }
+
+    #[test]
+    fn ree_take_dense_null_index_skips_out_of_bounds_value() {
+        let indices = PrimitiveArray::new(
+            buffer![0u64, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12],
+            Validity::Array(
+                BoolArray::from_iter([
+                    true, true, true, true, true, true, true, true, true, true, true, false,
+                ])
+                .into_array(),
+            ),
+        );
+        let taken = ree_array().take(indices.into_array()).unwrap();
+
+        let expected = PrimitiveArray::from_option_iter([
+            Some(1i32),
+            Some(1),
+            Some(1),
+            Some(4),
+            Some(4),
+            Some(4),
+            Some(2),
+            Some(2),
+            Some(5),
+            Some(5),
+            Some(5),
+            None,
+        ]);
         assert_arrays_eq!(taken, expected.into_array());
     }
 
