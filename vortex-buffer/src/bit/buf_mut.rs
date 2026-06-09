@@ -3,7 +3,7 @@
 
 use std::ops::Not;
 
-use bitvec::view::BitView;
+use arrow_buffer::bit_mask::set_bits;
 
 use crate::BitBuffer;
 use crate::BufferMut;
@@ -487,24 +487,32 @@ impl BitBufferMut {
         let end_bit_pos = start_bit_pos + bit_len;
         let required_bytes = end_bit_pos.div_ceil(8);
 
+        // `set_bits` below ORs into the destination, so stale bits past `len` in the existing
+        // bytes (e.g. after `truncate` or `clear`) must be cleared first. Bytes appended below
+        // are already zeroed.
+        let existing_bits = self.buffer.len() * 8;
+        if existing_bits > start_bit_pos {
+            fill_bits(
+                self.buffer.as_mut_slice(),
+                start_bit_pos,
+                existing_bits.min(end_bit_pos),
+                false,
+            );
+        }
+
         // Ensure buffer has enough bytes
         if required_bytes > self.buffer.len() {
             self.buffer.push_n(0x00, required_bytes - self.buffer.len());
         }
 
-        // Use bitvec for efficient bit copying
-        let self_slice = self
-            .buffer
-            .as_mut_slice()
-            .view_bits_mut::<bitvec::prelude::Lsb0>();
-        let other_slice = buffer
-            .inner()
-            .as_slice()
-            .view_bits::<bitvec::prelude::Lsb0>();
-
-        // Copy from source buffer (accounting for its offset) to destination (accounting for our offset + len)
-        let source_range = buffer.offset()..buffer.offset() + bit_len;
-        self_slice[start_bit_pos..end_bit_pos].copy_from_bitslice(&other_slice[source_range]);
+        // Word-wise bit copy that handles mismatched source/destination bit offsets.
+        set_bits(
+            self.buffer.as_mut_slice(),
+            buffer.inner().as_slice(),
+            start_bit_pos,
+            buffer.offset(),
+            bit_len,
+        );
 
         self.len += bit_len;
     }
@@ -879,7 +887,43 @@ mod tests {
         assert!(frozen.value(7));
     }
 
-    #[cfg_attr(miri, ignore)] // bitvec crate uses a ptr cast that Miri doesn't support
+    #[test]
+    fn test_append_buffer_after_truncate() {
+        // Truncating leaves stale set bits in the last partial byte; an append after that
+        // must overwrite them rather than OR into them.
+        let mut buf = BitBufferMut::new_set(16);
+        buf.truncate(3);
+        buf.append_buffer(&crate::BitBuffer::new_unset(8));
+
+        let frozen = buf.freeze();
+        assert_eq!(frozen.len(), 11);
+        for i in 0..3 {
+            assert!(frozen.value(i), "bit {i} should be set");
+        }
+        for i in 3..11 {
+            assert!(!frozen.value(i), "bit {i} should be unset");
+        }
+    }
+
+    #[test]
+    fn test_append_buffer_misaligned_long() {
+        // Force mismatched source/destination bit offsets across many words.
+        let source = crate::BitBuffer::from_iter((0..301).map(|i| i % 3 == 0));
+        let source = source.slice(5..301);
+
+        let mut dest = BitBufferMut::with_capacity(512);
+        dest.append_n(true, 3);
+        dest.append_buffer(&source);
+
+        assert_eq!(dest.len(), 3 + source.len());
+        for i in 0..3 {
+            assert!(dest.value(i), "prefix bit {i}");
+        }
+        for i in 0..source.len() {
+            assert_eq!(dest.value(3 + i), source.value(i), "bit {i}");
+        }
+    }
+
     #[test]
     fn test_append_buffer_with_offsets() {
         // Create source buffer with offset
