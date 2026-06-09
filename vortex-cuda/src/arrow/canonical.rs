@@ -1966,6 +1966,58 @@ mod tests {
     }
 
     #[crate::test]
+    async fn test_export_binary_empty_and_all_null() -> VortexResult<()> {
+        let mut ctx = CudaSession::create_execution_ctx(&VortexSession::empty())
+            .vortex_expect("failed to create execution context");
+
+        let empty = VarBinViewArray::from_iter_nullable_bin(std::iter::empty::<Option<&[u8]>>())
+            .into_array();
+        let mut exported = empty.export_device_array_with_schema(&mut ctx).await?;
+        let field = Field::try_from(&exported.schema)?;
+        assert_eq!(field, Field::new("", DataType::Binary, true));
+        assert_binary_layout(&exported.array.array, 0, 0, &[0], b"")?;
+        assert_eq!(exported.array.device_type, ARROW_DEVICE_CUDA);
+        unsafe { release_exported_array(&raw mut exported.array.array) };
+
+        let all_null =
+            VarBinViewArray::from_iter_nullable_bin([None::<&[u8]>, None::<&[u8]>]).into_array();
+        let mut exported = all_null.export_device_array_with_schema(&mut ctx).await?;
+        let field = Field::try_from(&exported.schema)?;
+        assert_eq!(field, Field::new("", DataType::Binary, true));
+        assert_binary_layout(&exported.array.array, 2, 2, &[0, 0, 0], b"")?;
+        assert_eq!(exported.array.device_type, ARROW_DEVICE_CUDA);
+        unsafe { release_exported_array(&raw mut exported.array.array) };
+
+        Ok(())
+    }
+
+    #[crate::test]
+    async fn test_export_binary_invalid_data_buffer_ref_errors() -> VortexResult<()> {
+        let mut ctx = CudaSession::create_execution_ctx(&VortexSession::empty())
+            .vortex_expect("failed to create execution context");
+
+        let view = BinaryView::make_view(b"this references a missing data buffer", 0, 0);
+        let array = VarBinViewArray::new_handle(
+            BufferHandle::new_host(Buffer::from_iter([view]).into_byte_buffer()),
+            Arc::from([]),
+            DType::Binary(Nullability::NonNullable),
+            Validity::NonNullable,
+        )
+        .into_array();
+
+        let err = array
+            .export_device_array_with_schema(&mut ctx)
+            .await
+            .expect_err("missing binary data buffer should fail");
+        assert!(
+            err.to_string()
+                .contains("a view references an invalid data buffer")
+        );
+
+        Ok(())
+    }
+
+    #[crate::test]
     async fn test_export_list() -> VortexResult<()> {
         let mut ctx = CudaSession::create_execution_ctx(&VortexSession::empty())
             .vortex_expect("failed to create execution context");

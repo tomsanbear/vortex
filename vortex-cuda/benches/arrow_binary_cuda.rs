@@ -26,7 +26,6 @@ use vortex::array::validity::Validity;
 use vortex::buffer::Buffer;
 use vortex::buffer::ByteBuffer;
 use vortex::dtype::DType;
-use vortex::dtype::Nullability;
 use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
 use vortex::session::VortexSession;
@@ -46,6 +45,15 @@ async fn binary_on_device(
     buffers: Arc<[ByteBuffer]>,
     ctx: &mut CudaExecutionCtx,
 ) -> VortexResult<ArrayRef> {
+    binary_on_device_with_validity(views, buffers, Validity::NonNullable, ctx).await
+}
+
+async fn binary_on_device_with_validity(
+    views: Buffer<BinaryView>,
+    buffers: Arc<[ByteBuffer]>,
+    validity: Validity,
+    ctx: &mut CudaExecutionCtx,
+) -> VortexResult<ArrayRef> {
     let views = ctx
         .ensure_on_device(BufferHandle::new_host(views.into_byte_buffer()))
         .await?;
@@ -60,8 +68,8 @@ async fn binary_on_device(
     Ok(VarBinViewArray::new_handle(
         views,
         device_buffers.into(),
-        DType::Binary(Nullability::NonNullable),
-        Validity::NonNullable,
+        DType::Binary(validity.nullability()),
+        validity,
     )
     .into_array())
 }
@@ -83,6 +91,14 @@ async fn out_of_line_binary(len: usize, ctx: &mut CudaExecutionCtx) -> VortexRes
     }));
 
     binary_on_device(views, Arc::from([values]), ctx).await
+}
+
+async fn sliced_validity_binary(len: usize, ctx: &mut CudaExecutionCtx) -> VortexResult<ArrayRef> {
+    let views =
+        Buffer::from_iter((0..len).map(|idx| BinaryView::make_view(&idx.to_le_bytes(), 0, 0)));
+    let validity = Validity::from_iter((0..=len).map(|idx| idx % 3 != 0)).slice(1..len + 1)?;
+
+    binary_on_device_with_validity(views, Arc::from([]), validity, ctx).await
 }
 
 unsafe fn release_arrow_device_array(array: &mut ArrowDeviceArray) {
@@ -141,6 +157,35 @@ fn benchmark_arrow_binary_export(c: &mut Criterion) {
                         .vortex_expect("failed to create execution context")
                         .with_launch_strategy(Arc::new(timed));
                     let array = block_on(out_of_line_binary(len, &mut cuda_ctx))
+                        .vortex_expect("failed to create binary fixture");
+
+                    for _ in 0..iters {
+                        let mut exported =
+                            block_on(array.clone().export_device_array(&mut cuda_ctx))
+                                .vortex_expect("failed to export device array");
+                        unsafe { release_arrow_device_array(&mut exported) };
+                    }
+
+                    Duration::from_nanos(timer.load(Ordering::Relaxed))
+                });
+            },
+        );
+
+        group.throughput(Throughput::Bytes(
+            (len * (size_of::<BinaryView>() + 8) + len.div_ceil(8)) as u64,
+        ));
+        group.bench_with_input(
+            BenchmarkId::new("cuda/arrow_binary/sliced_validity", len_label),
+            &len,
+            |b, &len| {
+                b.iter_custom(|iters| {
+                    let timed = TimedLaunchStrategy::default();
+                    let timer = timed.timer();
+
+                    let mut cuda_ctx = CudaSession::create_execution_ctx(&VortexSession::empty())
+                        .vortex_expect("failed to create execution context")
+                        .with_launch_strategy(Arc::new(timed));
+                    let array = block_on(sliced_validity_binary(len, &mut cuda_ctx))
                         .vortex_expect("failed to create binary fixture");
 
                     for _ in 0..iters {
