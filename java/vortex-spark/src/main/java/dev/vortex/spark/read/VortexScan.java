@@ -5,15 +5,11 @@ package dev.vortex.spark.read;
 
 import dev.vortex.api.DataSource;
 import dev.vortex.api.Session;
-import dev.vortex.jni.NativeFiles;
 import dev.vortex.spark.VortexSparkSession;
 import java.util.Arrays;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.OptionalLong;
-import java.util.stream.Collectors;
-import java.util.stream.Stream;
 import org.apache.spark.sql.connector.catalog.CatalogV2Util;
 import org.apache.spark.sql.connector.catalog.Column;
 import org.apache.spark.sql.connector.expressions.NamedReference;
@@ -140,14 +136,7 @@ public final class VortexScan implements Scan, SupportsReportStatistics {
 
     private Statistics computeStatistics() {
         Session session = VortexSparkSession.get(formatOptions);
-        // Expand directory paths to concrete files the way VortexBatchExec does, so we use the
-        // same per-path resolution end-to-end.
-        List<String> resolvedPaths = paths.stream()
-                .flatMap(path -> path.endsWith(".vortex")
-                        ? Stream.of(path)
-                        : NativeFiles.listFiles(session, path, formatOptions).stream())
-                .collect(Collectors.toList());
-
+        List<String> resolvedPaths = VortexBatchExec.resolveVortexPaths(session, paths, formatOptions);
         if (resolvedPaths.isEmpty()) {
             return new VortexStatistics(OptionalLong.empty(), OptionalLong.empty());
         }
@@ -181,7 +170,7 @@ public final class VortexScan implements Scan, SupportsReportStatistics {
 
         @Override
         public Map<NamedReference, ColumnStatistics> columnStats() {
-            return new HashMap<>();
+            return Map.of();
         }
     }
 }

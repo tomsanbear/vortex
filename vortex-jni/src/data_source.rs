@@ -16,8 +16,6 @@ use std::path::PathBuf;
 use std::path::absolute;
 use std::sync::Arc;
 
-use futures::StreamExt;
-use futures::stream;
 use jni::EnvUnowned;
 use jni::objects::JClass;
 use jni::objects::JLongArray;
@@ -30,7 +28,6 @@ use vortex::error::VortexResult;
 use vortex::error::vortex_err;
 use vortex::expr::stats::Precision;
 use vortex::file::multi::MultiFileDataSource;
-use vortex::io::filesystem::FileListing;
 use vortex::io::filesystem::FileSystemRef;
 use vortex::io::runtime::BlockingRuntime;
 use vortex::io::session::RuntimeSessionExt;
@@ -43,10 +40,6 @@ use crate::errors::try_or_throw;
 use crate::file::extract_properties;
 use crate::object_store::object_store_fs;
 use crate::session::session_ref;
-
-/// In-flight size lookups while resolving exact paths to file listings. Balances HEAD
-/// throughput on remote stores against connection overhead.
-const SIZE_LOOKUP_CONCURRENCY: usize = 16;
 
 /// Wraps an `Arc<dyn DataSource>` behind a single pointer.
 pub(crate) struct NativeDataSource {
@@ -110,49 +103,14 @@ pub extern "system" fn Java_dev_vortex_jni_NativeDataSource_open(
             }
         }
 
-        // Split inputs into glob patterns (which fs.glob() expands via list(), capturing sizes
-        // automatically) and exact paths (which are resolved one-by-one with a HEAD-style size
-        // lookup so the data source can report total bytes for Spark-style stats).
-        let mut glob_inputs: Vec<(String, FileSystemRef)> = Vec::new();
-        let mut exact_inputs: Vec<(String, FileSystemRef)> = Vec::new();
+        let mut builder = MultiFileDataSource::new(session.clone());
         for glob_url in &glob_urls {
             let base = base_url(glob_url);
             let fs = fs_cache
                 .get(&base)
                 .cloned()
                 .unwrap_or_else(|| unreachable!("fs cached for every base url"));
-            let path = glob_url.path().to_string();
-            if path.contains(['*', '?', '[']) {
-                glob_inputs.push((path, fs));
-            } else {
-                exact_inputs.push((path, fs));
-            }
-        }
-
-        let resolved_listings: Vec<(FileListing, FileSystemRef)> = if exact_inputs.is_empty() {
-            Vec::new()
-        } else {
-            RUNTIME.block_on(async {
-                stream::iter(exact_inputs)
-                    .map(|(path, fs)| async move {
-                        let size = match fs.open_read(&path).await {
-                            Ok(source) => source.size().await.ok(),
-                            Err(_) => None,
-                        };
-                        (FileListing { path, size }, fs)
-                    })
-                    .buffer_unordered(SIZE_LOOKUP_CONCURRENCY)
-                    .collect::<Vec<_>>()
-                    .await
-            })
-        };
-
-        let mut builder = MultiFileDataSource::new(session.clone());
-        for (glob, fs) in glob_inputs {
-            builder = builder.with_glob(glob, Some(fs));
-        }
-        for (listing, fs) in resolved_listings {
-            builder = builder.with_listing(listing, fs);
+            builder = builder.with_glob(glob_url.path(), Some(fs));
         }
 
         let inner = RUNTIME

@@ -530,3 +530,43 @@ impl Partition for MultiLayoutPartition {
         )))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+    use vortex_array::dtype::Nullability;
+
+    use super::*;
+    use crate::scan::test::new_session;
+
+    struct NeverOpened;
+
+    #[async_trait]
+    impl LayoutReaderFactory for NeverOpened {
+        async fn open(&self) -> VortexResult<Option<LayoutReaderRef>> {
+            unreachable!("byte_size must not open readers")
+        }
+    }
+
+    fn deferred_source(byte_sizes: Vec<Option<u64>>) -> MultiLayoutDataSource {
+        let factories: Vec<Arc<dyn LayoutReaderFactory>> = byte_sizes
+            .iter()
+            .map(|_| Arc::new(NeverOpened) as _)
+            .collect();
+        MultiLayoutDataSource::new_deferred(
+            DType::Bool(Nullability::NonNullable),
+            factories,
+            byte_sizes,
+            &new_session(),
+        )
+    }
+
+    #[rstest]
+    #[case::all_known(vec![Some(10), Some(20), Some(30)], Precision::exact(60u64))]
+    #[case::some_known_extrapolates(vec![Some(10), None, Some(30)], Precision::inexact(60u64))]
+    #[case::none_known(vec![None, None], Precision::Absent)]
+    #[case::no_children(vec![], Precision::exact(0u64))]
+    fn byte_size_precision(#[case] sizes: Vec<Option<u64>>, #[case] expected: Precision<u64>) {
+        assert_eq!(deferred_source(sizes).byte_size(), expected);
+    }
+}

@@ -98,8 +98,8 @@ public final class VortexDataSourceStatsTest {
     public void testEstimateStatisticsReportsSizeInBytes() throws IOException {
         Path outputPath = writeRows(120, "with_size", 3);
 
-        long expectedTotalBytes = totalVortexFileBytes(outputPath);
-        assertTrue(expectedTotalBytes > 0, "Test setup should produce at least one non-empty .vortex file");
+        long fileBytes = totalVortexFileBytes(outputPath);
+        assertTrue(fileBytes > 0, "Test setup should produce at least one non-empty .vortex file");
 
         VortexScan scan = buildScan(outputPath);
         Statistics stats = scan.estimateStatistics();
@@ -107,8 +107,17 @@ public final class VortexDataSourceStatsTest {
         assertTrue(
                 stats.sizeInBytes().isPresent(),
                 "VortexScan should surface a sizeInBytes when the filesystem listing reports file sizes");
+        // Mirror the scan's Spark-convention scaling (factor 1.0, unpruned schema), which divides and
+        // re-multiplies by the schema default size in double arithmetic before truncating; asserting
+        // against the raw byte sum would be sensitive to the floating-point round trip.
+        StructType schema = spark.read()
+                .format("vortex")
+                .option("path", outputPath.toUri().toString())
+                .load()
+                .schema();
+        long expectedSize = (long) (1.0 * fileBytes / schema.defaultSize() * schema.defaultSize());
         assertEquals(
-                expectedTotalBytes,
+                expectedSize,
                 stats.sizeInBytes().getAsLong(),
                 "sizeInBytes should equal the sum of on-storage .vortex file sizes");
     }
