@@ -104,8 +104,7 @@ __device__ void validate_offsets_device(const BinaryView *const views,
 
         const uint32_t size = is_valid(validity, has_validity, idx) ? views[idx].size : 0;
         const int64_t expected = static_cast<int64_t>(offset) + static_cast<int64_t>(size);
-        if (expected > static_cast<int64_t>(INT32_MAX) ||
-            expected != static_cast<int64_t>(next_offset)) {
+        if (expected > static_cast<int64_t>(INT32_MAX) || expected != static_cast<int64_t>(next_offset)) {
             atomicMax(status, 2u);
         }
     }
@@ -143,8 +142,7 @@ __device__ void gather_device(const BinaryView *const views,
             const uint64_t buffer_index = static_cast<uint64_t>(view_ref->buffer_index);
             const uint64_t offset = static_cast<uint64_t>(view_ref->offset);
             const uint64_t end = offset + static_cast<uint64_t>(size);
-            if (buffer_index >= data_buffer_count || end < offset ||
-                end > data_buffer_lens[buffer_index]) {
+            if (buffer_index >= data_buffer_count || end < offset || end > data_buffer_lens[buffer_index]) {
                 atomicMax(status, 1u);
                 continue;
             }
