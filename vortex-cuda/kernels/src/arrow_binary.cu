@@ -43,12 +43,20 @@ __device__ void repack_validity_device(const uint8_t *const input,
     const uint64_t stop = stop_elem(worker, output_bytes);
 
     for (uint64_t byte_idx = start; byte_idx < stop; byte_idx++) {
-        uint8_t byte = 0;
         const uint64_t first_bit = byte_idx * 8;
-        for (uint64_t bit_idx = 0; bit_idx < 8 && first_bit + bit_idx < len; bit_idx++) {
-            if (get_bit(input, input_offset + first_bit + bit_idx)) {
-                byte |= static_cast<uint8_t>(1u << bit_idx);
-            }
+        const uint64_t input_bit = input_offset + first_bit;
+        const uint64_t input_byte = input_bit / 8;
+        const uint32_t bit_offset = static_cast<uint32_t>(input_bit % 8);
+        const uint32_t bits = static_cast<uint32_t>(min(static_cast<uint64_t>(8), len - first_bit));
+
+        uint16_t shifted = static_cast<uint16_t>(input[input_byte]) >> bit_offset;
+        if (bit_offset + bits > 8) {
+            shifted |= static_cast<uint16_t>(input[input_byte + 1]) << (8 - bit_offset);
+        }
+
+        uint8_t byte = static_cast<uint8_t>(shifted);
+        if (bits < 8) {
+            byte &= static_cast<uint8_t>((1u << bits) - 1u);
         }
         output[byte_idx] = byte;
     }
