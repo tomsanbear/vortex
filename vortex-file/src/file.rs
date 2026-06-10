@@ -12,7 +12,7 @@ use std::sync::OnceLock;
 
 use itertools::Itertools;
 use vortex_array::ArrayRef;
-use vortex_array::Columnar;
+use vortex_array::Canonical;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::ConstantArray;
@@ -244,11 +244,19 @@ impl VortexFile {
             ConstantArray::new(self.footer.row_count(), applied.len()).into_array();
         let applied = substitute_row_count(applied, &row_count_replacement)?;
 
+        // The pruning predicate is evaluated over the single file-stats row, so the
+        // result is a one-row boolean; read it out the same way
+        // `FileStatsLayoutReader::evaluate_file_stats` does. Composite falsifications
+        // (boolean combinators, and the `or` that `Eq` falsification produces) no
+        // longer constant-fold since `ScalarFnConstantRule` was removed, so matching
+        // on `Columnar::Constant` alone would conservatively refuse to prune them.
         let mut ctx = self.session.create_execution_ctx();
-        Ok(match applied.execute::<Columnar>(&mut ctx)? {
-            Columnar::Constant(s) => s.scalar().as_bool().value() == Some(true),
-            Columnar::Canonical(_) => false,
-        })
+        let result = applied
+            .execute::<Canonical>(&mut ctx)?
+            .into_bool()
+            .into_array()
+            .execute_scalar(0, &mut ctx)?;
+        Ok(result.as_bool().value() == Some(true))
     }
 
     pub fn splits(&self) -> VortexResult<Vec<Range<u64>>> {

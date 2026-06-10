@@ -35,6 +35,7 @@ use vortex_array::dtype::PType::I32;
 use vortex_array::dtype::StructFields;
 use vortex_array::expr::and;
 use vortex_array::expr::cast;
+use vortex_array::expr::col;
 use vortex_array::expr::eq;
 use vortex_array::expr::get_item;
 use vortex_array::expr::gt;
@@ -1952,4 +1953,50 @@ async fn test_segment_ordering_zonemaps_after_data() -> VortexResult<()> {
     );
 
     Ok(())
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn test_can_prune_composite_predicates() {
+    // Regression test for `can_prune` after `ScalarFnConstantRule` was removed
+    // (#7575): composite falsification trees no longer constant-fold during
+    // execution, so `can_prune` must read the one-row evaluated result instead
+    // of requiring a `Columnar::Constant`. `Eq` is affected too: its
+    // falsification is internally `or(min > lit, lit > max)`.
+    let st = StructArray::from_fields(&[
+        ("age", buffer![15i32, 18, 22, 25].into_array()),
+        ("price", buffer![120i32, 130, 140, 150].into_array()),
+    ])
+    .unwrap();
+    let mut buf = ByteBufferMut::empty();
+    SESSION
+        .write_options()
+        .write(&mut buf, st.into_array().to_array_stream())
+        .await
+        .unwrap();
+    let file = SESSION.open_options().open_buffer(buf).unwrap();
+
+    // Bare comparisons: falsified directly by min/max stats.
+    assert!(file.can_prune(&gt(col("age"), lit(30))).unwrap());
+    assert!(file.can_prune(&lt(col("price"), lit(100))).unwrap());
+
+    // Composite predicates whose falsifications are boolean trees.
+    assert!(
+        file.can_prune(&and(gt(col("age"), lit(30)), lt(col("price"), lit(100))))
+            .unwrap()
+    );
+    assert!(
+        file.can_prune(&or(gt(col("age"), lit(30)), lt(col("age"), lit(10))))
+            .unwrap()
+    );
+    assert!(file.can_prune(&eq(col("age"), lit(5))).unwrap());
+
+    // Non-falsifiable controls: rows may match, so pruning must refuse.
+    assert!(!file.can_prune(&gt(col("age"), lit(20))).unwrap());
+    assert!(!file.can_prune(&eq(col("age"), lit(18))).unwrap());
+    assert!(
+        !file
+            .can_prune(&and(gt(col("age"), lit(20)), gt(col("price"), lit(100))))
+            .unwrap()
+    );
 }
