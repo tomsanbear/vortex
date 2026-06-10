@@ -64,5 +64,9 @@ tokio = { workspace = true, features = ["full"] }
 object_store = ["dep:object_store", "vortex-error/object_store"]
 tokio = ["tokio/fs", "tokio/rt-multi-thread"]
 
+[[example]]
+name = "read_at_ablation"
+required-features = ["object_store", "tokio"]
+
 [lints]
 workspace = true
