@@ -1110,10 +1110,13 @@ unsafe extern "C" fn release_array(array: *mut ArrowArray) {
 
         if !private_data_ptr.is_null() {
             let mut private_data = Box::from_raw(private_data_ptr.cast::<PrivateData>());
-            // Consumers may enqueue reads of exported buffers on their own CUDA stream before
-            // calling release. Synchronize the context before BufferHandle drops enqueue frees on
-            // Vortex's stream, otherwise async cuMemFree can race those consumer reads.
-            let _ = cuda_driver::ctx::synchronize();
+            // Release may run on a foreign thread; bind this array's context before synchronizing
+            // so async frees cannot race consumer-side reads.
+            let cuda_context = Arc::clone(private_data.cuda_stream.context());
+            match cuda_context.bind_to_thread() {
+                Ok(()) => cuda_context.record_err(cuda_driver::ctx::synchronize()),
+                Err(err) => cuda_context.record_err(Err::<(), _>(err)),
+            }
             release_children(&mut private_data);
             release_dictionary(&mut private_data);
         }
