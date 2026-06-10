@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! CUDA benchmarks for Arrow Device export of binary view arrays as Arrow Binary.
+//! CUDA kernel-time benchmarks for Arrow Device export of binary view arrays as Arrow Binary.
 
 #![expect(clippy::cast_possible_truncation)]
 
@@ -137,7 +137,7 @@ fn benchmark_arrow_binary_export(c: &mut Criterion) {
             (len * (size_of::<BinaryView>() + 8)) as u64,
         ));
         group.bench_with_input(
-            BenchmarkId::new("cuda/arrow_binary/inline", len_label),
+            BenchmarkId::new("cuda/arrow_binary_kernel_time/inline", len_label),
             &len,
             |b, &len| {
                 b.iter_custom(|iters| {
@@ -166,7 +166,7 @@ fn benchmark_arrow_binary_export(c: &mut Criterion) {
             (len * (size_of::<BinaryView>() + 16 + 8)) as u64,
         ));
         group.bench_with_input(
-            BenchmarkId::new("cuda/arrow_binary/out_of_line", len_label),
+            BenchmarkId::new("cuda/arrow_binary_kernel_time/out_of_line", len_label),
             &len,
             |b, &len| {
                 b.iter_custom(|iters| {
@@ -195,7 +195,7 @@ fn benchmark_arrow_binary_export(c: &mut Criterion) {
             (len * (size_of::<BinaryView>() + 8) + len.div_ceil(8)) as u64,
         ));
         group.bench_with_input(
-            BenchmarkId::new("cuda/arrow_binary/sliced_validity", len_label),
+            BenchmarkId::new("cuda/arrow_binary_kernel_time/sliced_validity", len_label),
             &len,
             |b, &len| {
                 b.iter_custom(|iters| {
@@ -229,7 +229,7 @@ fn benchmark_arrow_binary_export(c: &mut Criterion) {
         ));
         group.bench_with_input(
             BenchmarkId::new(
-                format!("cuda/arrow_binary/sliced_validity/{bit_offset_label}"),
+                format!("cuda/arrow_binary_kernel_time/sliced_validity/{bit_offset_label}"),
                 len_label,
             ),
             &(len, bit_offset),
@@ -269,7 +269,7 @@ fn benchmark_arrow_binary_repack_validity(c: &mut Criterion) {
             group.throughput(Throughput::Bytes((output_bytes * 2) as u64));
             group.bench_with_input(
                 BenchmarkId::new(
-                    format!("cuda/arrow_binary/repack_validity/{bit_offset_label}"),
+                    format!("cuda/arrow_binary_kernel_time/repack_validity/{bit_offset_label}"),
                     len_label,
                 ),
                 &(len, bit_offset),
