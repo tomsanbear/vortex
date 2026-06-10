@@ -112,7 +112,7 @@ void ScalarFnCollect::VisitOperator(LogicalOperator &op) {
      * used in projection. Example: PROJECTION(col) -> GET(col). We don't want
      * to visit BoundColumnRefExpression in PROJECTION.
      *
-     * However, ScalarFnReplace will visie them because we need to update their
+     * However, ScalarFnReplace will visit them because we need to update their
      * types if pushdown succeeded.
      */
     if (op.type == LogicalOperatorType::LOGICAL_PROJECTION &&
@@ -162,19 +162,22 @@ ExpressionPtr ScalarFnCollect::VisitReplace(BoundFunctionExpression &expr, Expre
     return std::move(*ptr);
 }
 
+static bool conflict(const GetAnalysis &analysis, TableColumnScanIndex idx) {
+    const auto it = analysis.col_to_fn.find(idx);
+    return it == analysis.col_to_fn.end() || it->second == nullptr;
+}
+
 ExpressionPtr ScalarFnReplace::VisitReplace(BoundColumnRefExpression &expr, ExpressionPtr *ptr) {
     const auto binding = Resolve(expr.binding, analyses, projections);
     if (!binding) {
         return std::move(*ptr);
     }
+
     const auto &[analysis, column_index] = *binding;
-    if (auto it = analysis.col_to_fn.find(column_index);
-        it == analysis.col_to_fn.end() || it->second == nullptr) {
-        // This column has a conflict, don't replace it
-        return std::move(*ptr);
+    if (!conflict(analysis, column_index)) {
+        expr.return_type = analysis.get.types[column_index];
     }
 
-    expr.return_type = analysis.get.types[column_index];
     return std::move(*ptr);
 }
 
@@ -189,11 +192,9 @@ ExpressionPtr ScalarFnReplace::VisitReplace(BoundFunctionExpression &expr, Expre
     if (!binding) {
         return std::move(*ptr);
     }
-    const auto &[analysis, column_index] = *binding;
 
-    if (auto it = analysis.col_to_fn.find(column_index);
-        it == analysis.col_to_fn.end() || it->second == nullptr) {
-        // This column has a conflict, don't replace it
+    const auto &[analysis, column_index] = *binding;
+    if (conflict(analysis, column_index)) {
         return std::move(*ptr);
     }
 
