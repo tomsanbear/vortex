@@ -2023,6 +2023,32 @@ mod tests {
     }
 
     #[crate::test]
+    async fn test_export_binary_i32_offset_overflow_errors() -> VortexResult<()> {
+        let mut ctx = CudaSession::create_execution_ctx(&VortexSession::empty())
+            .vortex_expect("failed to create execution context");
+
+        let view = BinaryView::new_ref(i32::MAX as u32 + 1, [0; 4], 0, 0);
+        let array = VarBinViewArray::new_handle(
+            BufferHandle::new_host(Buffer::from_iter([view]).into_byte_buffer()),
+            Arc::from([]),
+            DType::Binary(Nullability::NonNullable),
+            Validity::NonNullable,
+        )
+        .into_array();
+
+        let err = array
+            .export_device_array_with_schema(&mut ctx)
+            .await
+            .expect_err("oversized binary value should fail Arrow Binary export");
+        assert!(
+            err.to_string()
+                .contains("offsets exceed i32 range required by Arrow Binary")
+        );
+
+        Ok(())
+    }
+
+    #[crate::test]
     async fn test_export_list() -> VortexResult<()> {
         let mut ctx = CudaSession::create_execution_ctx(&VortexSession::empty())
             .vortex_expect("failed to create execution context");
