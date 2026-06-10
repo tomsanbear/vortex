@@ -13,6 +13,7 @@ use std::sync::LazyLock;
 
 use arrow_array::Array;
 use arrow_array::ArrayRef as ArrowArrayRef;
+use arrow_array::BinaryArray;
 use arrow_array::Date32Array;
 use arrow_array::Decimal32Array;
 use arrow_array::Decimal64Array;
@@ -155,6 +156,21 @@ fn multi_buffer_utf8_array() -> VortexArrayRef {
     multi_buffer_varbinview(DType::Utf8(Nullability::NonNullable))
 }
 
+fn binary_array() -> VortexArrayRef {
+    VarBinViewArray::from_iter_nullable_bin([
+        Some(b"" as &[u8]),
+        Some(b"\x00\xff"),
+        None,
+        Some(b"this binary payload is longer than twelve bytes"),
+        Some(b"short"),
+    ])
+    .into_array()
+}
+
+fn multi_buffer_binary_array() -> VortexArrayRef {
+    multi_buffer_varbinview(DType::Binary(Nullability::NonNullable))
+}
+
 /// Build a small dictionary column for cuDF Arrow Device import validation.
 fn dictionary_array() -> VortexArrayRef {
     VortexDictArray::try_new(
@@ -226,6 +242,8 @@ fn export_array_inner(schema_ptr: &mut FFI_ArrowSchema, array_ptr: &mut ArrowDev
             "decimal128",
             "strings",
             "multi_buffer_utf8",
+            "binary",
+            "multi_buffer_binary",
             "dates",
             "dictionary",
             "lists",
@@ -238,6 +256,8 @@ fn export_array_inner(schema_ptr: &mut FFI_ArrowSchema, array_ptr: &mut ArrowDev
             decimal128.into_array(),
             strings.into_array(),
             multi_buffer_utf8_array(),
+            binary_array(),
+            multi_buffer_binary_array(),
             dates.into_array(),
             dictionary_array(),
             list_array(),
@@ -331,6 +351,20 @@ fn validate_array_inner(ffi_schema: &FFI_ArrowSchema, ffi_array: &mut FFI_ArrowA
         Some("second value stored out-of-line"),
         Some("short"),
     ]);
+    let binary = BinaryArray::from_iter([
+        Some(b"" as &[u8]),
+        Some(b"\x00\xff"),
+        None,
+        Some(b"this binary payload is longer than twelve bytes" as &[u8]),
+        Some(b"short" as &[u8]),
+    ]);
+    let multi_buffer_binary = BinaryArray::from_iter([
+        Some(b"inline" as &[u8]),
+        Some(b"first value stored out-of-line" as &[u8]),
+        Some(b"" as &[u8]),
+        Some(b"second value stored out-of-line" as &[u8]),
+        Some(b"short" as &[u8]),
+    ]);
     let date = Date32Array::from(vec![Some(100i32), None, Some(300), Some(400), None]);
     let dictionary = Arc::new(
         vec![
@@ -367,6 +401,12 @@ fn validate_array_inner(ffi_schema: &FFI_ArrowSchema, ffi_array: &mut FFI_ArrowA
             multi_buffer_utf8.data_type().clone(),
             false,
         ),
+        Field::new("binary", binary.data_type().clone(), true),
+        Field::new(
+            "multi_buffer_binary",
+            multi_buffer_binary.data_type().clone(),
+            false,
+        ),
         Field::new("dates", date.data_type().clone(), true),
         Field::new("dictionary", dictionary.data_type().clone(), true),
         cudf_list_field("lists"),
@@ -379,13 +419,15 @@ fn validate_array_inner(ffi_schema: &FFI_ArrowSchema, ffi_array: &mut FFI_ArrowA
         return 1;
     }
 
-    let expected_arrays: [ArrowArrayRef; 8] = [
+    let expected_arrays: [ArrowArrayRef; 10] = [
         primitive,
         Arc::new(decimal32),
         Arc::new(decimal64),
         Arc::new(decimal128),
         Arc::new(string),
         Arc::new(multi_buffer_utf8),
+        Arc::new(binary),
+        Arc::new(multi_buffer_binary),
         Arc::new(date),
         dictionary,
     ];
@@ -401,11 +443,11 @@ fn validate_array_inner(ffi_schema: &FFI_ArrowSchema, ffi_array: &mut FFI_ArrowA
         }
     }
 
-    if !list_values_eq(list.as_ref(), struct_array.column(8).as_ref()) {
+    if !list_values_eq(list.as_ref(), struct_array.column(10).as_ref()) {
         eprintln!("wrong values for lists column");
         return 1;
     }
-    if !list_values_eq(fixed_size_list.as_ref(), struct_array.column(9).as_ref()) {
+    if !list_values_eq(fixed_size_list.as_ref(), struct_array.column(11).as_ref()) {
         eprintln!("wrong values for fixed_lists column");
         return 1;
     }
