@@ -66,9 +66,11 @@ __device__ void repack_validity_device(const uint8_t *const input,
 // never needs to read their view payload.
 __device__ void init_scan_device(const BinaryView *const views,
                                  const uint8_t *const validity,
+                                 const uint64_t *const data_buffer_lens,
                                  int32_t *const scan,
                                  uint32_t *const status,
                                  uint32_t has_validity,
+                                 uint64_t data_buffer_count,
                                  uint64_t len,
                                  uint64_t scan_len) {
     const uint64_t worker = blockIdx.x * blockDim.x + threadIdx.x;
@@ -81,13 +83,27 @@ __device__ void init_scan_device(const BinaryView *const views,
             continue;
         }
 
-        const uint32_t size = views[idx].size;
+        const BinaryView view = views[idx];
+        const uint32_t size = view.size;
         if (size > static_cast<uint32_t>(INT32_MAX)) {
             scan[idx] = 0;
             atomicMax(status, 2u);
-        } else {
-            scan[idx] = static_cast<int32_t>(size);
+            continue;
         }
+
+        if (size > MAX_INLINED_SIZE) {
+            const BinaryViewRef *const view_ref = reinterpret_cast<const BinaryViewRef *>(&view);
+            const uint64_t buffer_index = static_cast<uint64_t>(view_ref->buffer_index);
+            const uint64_t offset = static_cast<uint64_t>(view_ref->offset);
+            const uint64_t end = offset + static_cast<uint64_t>(size);
+            if (buffer_index >= data_buffer_count || end < offset || end > data_buffer_lens[buffer_index]) {
+                scan[idx] = 0;
+                atomicMax(status, 1u);
+                continue;
+            }
+        }
+
+        scan[idx] = static_cast<int32_t>(size);
     }
 }
 
@@ -178,12 +194,22 @@ extern "C" __global__ void arrow_binary_repack_validity(const uint8_t *const inp
 // Fill the CUB scan input with per-row binary lengths plus a final zero sentinel.
 extern "C" __global__ void arrow_binary_init_scan(const BinaryView *const views,
                                                   const uint8_t *const validity,
+                                                  const uint64_t *const data_buffer_lens,
                                                   int32_t *const scan,
                                                   uint32_t *const status,
                                                   uint32_t has_validity,
+                                                  uint64_t data_buffer_count,
                                                   uint64_t len,
                                                   uint64_t scan_len) {
-    init_scan_device(views, validity, scan, status, has_validity, len, scan_len);
+    init_scan_device(views,
+                     validity,
+                     data_buffer_lens,
+                     scan,
+                     status,
+                     has_validity,
+                     data_buffer_count,
+                     len,
+                     scan_len);
 }
 
 // Check that the scanned offsets are exactly the Arrow Binary offsets this input requires.

@@ -527,7 +527,16 @@ async fn export_binary_buffers(
     )
     .await?;
     let status = new_binary_status(ctx).await?;
-    let output_offsets = binary_offsets(views, validity, len, &status, ctx).await?;
+    let output_offsets = binary_offsets(
+        views,
+        validity,
+        &data_buffer_lens,
+        device_data_buffers.len(),
+        len,
+        &status,
+        ctx,
+    )
+    .await?;
     check_binary_status(&status).await?;
 
     validate_binary_offsets(views, validity, &output_offsets, len, &status, ctx)?;
@@ -653,11 +662,21 @@ fn validity_view_or_views<'a>(
 async fn binary_offsets(
     views: &BufferHandle,
     validity: Option<&BufferHandle>,
+    data_buffer_lens: &BufferHandle,
+    data_buffer_count: usize,
     len: usize,
     status: &BufferHandle,
     ctx: &mut CudaExecutionCtx,
 ) -> VortexResult<BufferHandle> {
-    let scan_input = init_binary_scan(views, validity, status, len, ctx)?;
+    let scan_input = init_binary_scan(
+        views,
+        validity,
+        data_buffer_lens,
+        data_buffer_count,
+        status,
+        len,
+        ctx,
+    )?;
     let output_offsets = exclusive_sum_i32(&scan_input, len + 1, ctx)?;
     Ok(BufferHandle::new_device(Arc::new(CudaDeviceBuffer::new(
         output_offsets,
@@ -667,6 +686,8 @@ async fn binary_offsets(
 fn init_binary_scan(
     views: &BufferHandle,
     validity: Option<&BufferHandle>,
+    data_buffer_lens: &BufferHandle,
+    data_buffer_count: usize,
     status: &BufferHandle,
     len: usize,
     ctx: &mut CudaExecutionCtx,
@@ -674,7 +695,9 @@ fn init_binary_scan(
     let scan_len = len + 1;
     let views_view = views.cuda_view::<u8>()?;
     let (validity_view, has_validity) = validity_view_or_views(views, validity)?;
+    let lens_view = data_buffer_lens.cuda_view::<u64>()?;
     let status_view = status.cuda_view::<u32>()?;
+    let data_buffer_count_u64 = data_buffer_count as u64;
     let len_u64 = len as u64;
     let scan_len_u64 = scan_len as u64;
     let scan_input = ctx.device_alloc::<i32>(scan_len)?;
@@ -683,9 +706,11 @@ fn init_binary_scan(
     ctx.launch_kernel(&kernel, scan_len, |args| {
         args.arg(&views_view)
             .arg(&validity_view)
+            .arg(&lens_view)
             .arg(&scan_input)
             .arg(&status_view)
             .arg(&has_validity)
+            .arg(&data_buffer_count_u64)
             .arg(&len_u64)
             .arg(&scan_len_u64);
     })?;
