@@ -464,14 +464,10 @@ async fn export_binary(
 
     let (validity_buffer, null_count) = export_binary_validity_buffer(validity, len, ctx).await?;
     let views = ctx.ensure_on_device(views).await?;
-    let (offsets, values, keep_alive) =
+    let (offsets, values) =
         export_binary_buffers(&views, &data_buffers, validity_buffer.as_ref(), len, ctx).await?;
 
-    let mut buffers = Vec::with_capacity(3 + keep_alive.len());
-    buffers.push(validity_buffer);
-    buffers.push(Some(offsets));
-    buffers.push(Some(values));
-    buffers.extend(keep_alive.into_iter().map(Some));
+    let buffers = vec![validity_buffer, Some(offsets), Some(values)];
 
     let mut private_data = PrivateData::new(buffers, vec![], ctx)?;
     let sync_event = private_data.sync_event();
@@ -499,7 +495,7 @@ async fn export_binary_buffers(
     validity: Option<&BufferHandle>,
     len: usize,
     ctx: &mut CudaExecutionCtx,
-) -> VortexResult<(BufferHandle, BufferHandle, Vec<BufferHandle>)> {
+) -> VortexResult<(BufferHandle, BufferHandle)> {
     if len == 0 {
         let offsets = ctx
             .ensure_on_device(BufferHandle::new_host(
@@ -509,7 +505,7 @@ async fn export_binary_buffers(
         let values =
             BufferHandle::new_device(Arc::new(CudaDeviceBuffer::new(ctx.device_alloc::<u8>(1)?)))
                 .slice(0..0);
-        return Ok((offsets, values, vec![]));
+        return Ok((offsets, values));
     }
 
     let mut device_data_buffers = Vec::with_capacity(data_buffers.len());
@@ -552,13 +548,7 @@ async fn export_binary_buffers(
     )?;
     check_binary_status(&status).await?;
 
-    let mut keep_alive = Vec::with_capacity(3 + device_data_buffers.len());
-    keep_alive.push(views.clone());
-    keep_alive.push(data_buffer_ptrs);
-    keep_alive.push(data_buffer_lens);
-    keep_alive.extend(device_data_buffers);
-
-    Ok((output_offsets, output_values, keep_alive))
+    Ok((output_offsets, output_values))
 }
 
 /// Export binary validity with bit offset zero, matching the Arrow Binary buffers we synthesize.
