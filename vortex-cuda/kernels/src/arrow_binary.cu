@@ -134,49 +134,59 @@ __device__ void validate_offsets_device(const BinaryView *const views,
     }
 }
 
+__device__ uint64_t upper_bound_offsets(const int32_t *const offsets, uint64_t len, uint64_t value) {
+    uint64_t first = 0;
+    while (len > 0) {
+        const uint64_t half = len / 2;
+        const uint64_t mid = first + half;
+        if (static_cast<uint64_t>(offsets[mid]) <= value) {
+            first = mid + 1;
+            len -= half + 1;
+        } else {
+            len = half;
+        }
+    }
+    return first;
+}
+
+__device__ const uint8_t *input_ptr(const BinaryView &view, const uint64_t *const data_buffer_ptrs) {
+    if (view.size <= MAX_INLINED_SIZE) {
+        return view.inline_data;
+    }
+
+    const BinaryViewRef *const view_ref = reinterpret_cast<const BinaryViewRef *>(&view);
+    return reinterpret_cast<const uint8_t *>(data_buffer_ptrs[view_ref->buffer_index]) + view_ref->offset;
+}
+
 // Copy BinaryView payload bytes into one contiguous Arrow Binary values buffer.
 __device__ void gather_device(const BinaryView *const views,
-                              const uint8_t *const validity,
                               const uint64_t *const data_buffer_ptrs,
-                              const uint64_t *const data_buffer_lens,
                               const int32_t *const offsets,
                               uint8_t *const output,
-                              uint32_t *const status,
-                              uint32_t has_validity,
-                              uint64_t data_buffer_count,
-                              uint64_t len) {
+                              uint64_t len,
+                              uint64_t total_bytes) {
     const uint64_t worker = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint64_t start = start_elem(worker, len);
-    const uint64_t stop = stop_elem(worker, len);
+    const uint64_t start = start_elem(worker, total_bytes);
+    const uint64_t stop = stop_elem(worker, total_bytes);
+    if (start == stop) {
+        return;
+    }
 
-    for (uint64_t idx = start; idx < stop; idx++) {
-        if (!is_valid(validity, has_validity, idx)) {
-            continue;
-        }
+    uint64_t row = upper_bound_offsets(offsets, len + 1, start) - 1;
+    uint64_t row_start = static_cast<uint64_t>(offsets[row]);
+    uint64_t row_end = static_cast<uint64_t>(offsets[row + 1]);
+    BinaryView view = views[row];
+    const uint8_t *input = input_ptr(view, data_buffer_ptrs);
 
-        const BinaryView view = views[idx];
-        const uint32_t size = view.size;
-        if (size == 0) {
-            continue;
+    for (uint64_t byte_idx = start; byte_idx < stop; byte_idx++) {
+        while (byte_idx >= row_end) {
+            row++;
+            row_start = static_cast<uint64_t>(offsets[row]);
+            row_end = static_cast<uint64_t>(offsets[row + 1]);
+            view = views[row];
+            input = input_ptr(view, data_buffer_ptrs);
         }
-
-        const uint8_t *input = view.inline_data;
-        if (size > MAX_INLINED_SIZE) {
-            const BinaryViewRef *const view_ref = reinterpret_cast<const BinaryViewRef *>(&view);
-            const uint64_t buffer_index = static_cast<uint64_t>(view_ref->buffer_index);
-            const uint64_t offset = static_cast<uint64_t>(view_ref->offset);
-            const uint64_t end = offset + static_cast<uint64_t>(size);
-            if (buffer_index >= data_buffer_count || end < offset || end > data_buffer_lens[buffer_index]) {
-                atomicMax(status, 1u);
-                continue;
-            }
-            input = reinterpret_cast<const uint8_t *>(data_buffer_ptrs[buffer_index]) + offset;
-        }
-
-        uint8_t *const output_value = output + static_cast<uint64_t>(offsets[idx]);
-        for (uint32_t byte_idx = 0; byte_idx < size; byte_idx++) {
-            output_value[byte_idx] = input[byte_idx];
-        }
+        output[byte_idx] = input[byte_idx - row_start];
     }
 }
 
@@ -224,23 +234,10 @@ extern "C" __global__ void arrow_binary_validate_offsets(const BinaryView *const
 
 // Gather inline and referenced BinaryView payloads into Arrow Binary's contiguous values buffer.
 extern "C" __global__ void arrow_binary_gather(const BinaryView *const views,
-                                               const uint8_t *const validity,
                                                const uint64_t *const data_buffer_ptrs,
-                                               const uint64_t *const data_buffer_lens,
                                                const int32_t *const offsets,
                                                uint8_t *const output,
-                                               uint32_t *const status,
-                                               uint32_t has_validity,
-                                               uint64_t data_buffer_count,
-                                               uint64_t len) {
-    gather_device(views,
-                  validity,
-                  data_buffer_ptrs,
-                  data_buffer_lens,
-                  offsets,
-                  output,
-                  status,
-                  has_validity,
-                  data_buffer_count,
-                  len);
+                                               uint64_t len,
+                                               uint64_t total_bytes) {
+    gather_device(views, data_buffer_ptrs, offsets, output, len, total_bytes);
 }

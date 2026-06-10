@@ -545,14 +545,10 @@ async fn export_binary_buffers(
     let total_bytes = total_binary_bytes(&output_offsets, len).await?;
     let output_values = gather_binary_values(
         views,
-        validity,
         &data_buffer_ptrs,
-        &data_buffer_lens,
-        device_data_buffers.len(),
         &output_offsets,
         total_bytes,
         len,
-        &status,
         ctx,
     )?;
     check_binary_status(&status).await?;
@@ -753,42 +749,33 @@ async fn total_binary_bytes(offsets: &BufferHandle, len: usize) -> VortexResult<
     usize::try_from(total).map_err(Into::into)
 }
 
-#[expect(clippy::too_many_arguments)]
 fn gather_binary_values(
     views: &BufferHandle,
-    validity: Option<&BufferHandle>,
     data_buffer_ptrs: &BufferHandle,
-    data_buffer_lens: &BufferHandle,
-    data_buffer_count: usize,
     offsets: &BufferHandle,
     total_bytes: usize,
     len: usize,
-    status: &BufferHandle,
     ctx: &mut CudaExecutionCtx,
 ) -> VortexResult<BufferHandle> {
-    let views_view = views.cuda_view::<u8>()?;
-    let (validity_view, has_validity) = validity_view_or_views(views, validity)?;
-    let ptrs_view = data_buffer_ptrs.cuda_view::<u64>()?;
-    let lens_view = data_buffer_lens.cuda_view::<u64>()?;
-    let offsets_view = offsets.cuda_view::<i32>()?;
     let output_values = ctx.device_alloc::<u8>(total_bytes.max(1))?;
-    let status_view = status.cuda_view::<u32>()?;
-    let data_buffer_count_u64 = data_buffer_count as u64;
-    let len_u64 = len as u64;
-    let kernel = ctx.load_function_with_suffixes("arrow_binary", &["gather"])?;
 
-    ctx.launch_kernel(&kernel, len, |args| {
-        args.arg(&views_view)
-            .arg(&validity_view)
-            .arg(&ptrs_view)
-            .arg(&lens_view)
-            .arg(&offsets_view)
-            .arg(&output_values)
-            .arg(&status_view)
-            .arg(&has_validity)
-            .arg(&data_buffer_count_u64)
-            .arg(&len_u64);
-    })?;
+    if total_bytes != 0 {
+        let views_view = views.cuda_view::<u8>()?;
+        let ptrs_view = data_buffer_ptrs.cuda_view::<u64>()?;
+        let offsets_view = offsets.cuda_view::<i32>()?;
+        let len_u64 = len as u64;
+        let total_bytes_u64 = total_bytes as u64;
+        let kernel = ctx.load_function_with_suffixes("arrow_binary", &["gather"])?;
+
+        ctx.launch_kernel(&kernel, total_bytes, |args| {
+            args.arg(&views_view)
+                .arg(&ptrs_view)
+                .arg(&offsets_view)
+                .arg(&output_values)
+                .arg(&len_u64)
+                .arg(&total_bytes_u64);
+        })?;
+    }
 
     Ok(
         BufferHandle::new_device(Arc::new(CudaDeviceBuffer::new(output_values)))
