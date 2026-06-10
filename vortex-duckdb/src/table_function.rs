@@ -435,17 +435,19 @@ pub fn pushdown_projection_expression(
     expr: &ExpressionRef,
     projection_id: usize,
 ) -> VortexResult<bool> {
-    let col_name = &bind_data.column_fields[projection_id].name;
+    let field = &bind_data.column_fields[projection_id];
+    let col_name = &field.name;
+    let col_dtype = &field.dtype;
     debug!(%expr, %projection_id, %col_name, "pushing down projection expression");
-    match try_from_projection_expression(expr, col_name)? {
+    match try_from_projection_expression(expr, col_name, col_dtype)? {
         None => {
             debug!(%expr, "failed to push down expression");
-            return Ok(false);
+            Ok(false)
         }
         Some(vx_expr) => {
-            bind_data.column_fields[projection_id].projection_fn = Some(vx_expr);
             debug!(%expr, "pushed down expression");
-            return Ok(true);
+            bind_data.column_fields[projection_id].projection_fn = Some(vx_expr);
+            Ok(true)
         }
     }
 }

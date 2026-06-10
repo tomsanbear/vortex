@@ -179,6 +179,7 @@ pub fn can_push_expression(value: &duckdb::ExpressionRef) -> bool {
 pub fn try_from_projection_expression(
     value: &duckdb::ExpressionRef,
     col_name: &str,
+    col_dtype: &DType,
 ) -> VortexResult<Option<Expression>> {
     let Some(value) = value.as_class() else {
         return Ok(None);
@@ -186,11 +187,9 @@ pub fn try_from_projection_expression(
     if let ExpressionClass::BoundFunction(func) = value {
         Ok(match func.scalar_function.name() {
             "strlen" => {
-                // byte_length returns u64 but strlen expects i64
-                // TODO(myrrc): transmute since no one cares about upper but
+                // byte_length returns U64; DuckDB's strlen expects I64
                 let col = byte_length(get_item(col_name, root()));
-                // This cast is an issue, it decompresses fsst
-                //let col = cast(col, DType::Primitive(PType::I64, false.into()));
+                let col = cast(col, DType::Primitive(PType::I64, col_dtype.nullability()));
                 Some(col)
             }
             _ => None,
