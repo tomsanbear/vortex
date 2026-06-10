@@ -150,6 +150,17 @@ impl Debug for WritableHostBuffer {
 pub trait HostAllocator: Debug + Send + Sync + 'static {
     /// Allocate a writable host buffer with the requested byte length and alignment.
     fn allocate(&self, len: usize, alignment: Alignment) -> VortexResult<WritableHostBuffer>;
+
+    /// Adopt externally allocated bytes as a host buffer without copying, returning `None` if
+    /// this allocator requires buffers to come from its own allocations (e.g. pinned or pooled
+    /// memory) or if `bytes` does not satisfy `alignment`. Adopted bytes keep their parent
+    /// allocation alive for the lifetime of the returned buffer and must remain valid and
+    /// immutable for an unbounded lifetime — never adopt slices of mutable or truncatable
+    /// mappings. Allocators that meter memory through [`HostAllocator::allocate`] should either
+    /// account adopted bytes here or decline adoption.
+    fn try_adopt(&self, _bytes: &Bytes, _alignment: Alignment) -> Option<ByteBuffer> {
+        None
+    }
 }
 
 /// Shared allocator reference used throughout session-scoped memory APIs.
@@ -243,6 +254,25 @@ impl HostAllocator for DefaultHostAllocator {
         Ok(WritableHostBuffer::new(Box::new(
             DefaultWritableHostBuffer { buffer, alignment },
         )))
+    }
+}
+
+/// Host allocator that adopts externally allocated, already-aligned bytes zero-copy.
+///
+/// Opt-in: adopted buffers keep their parent allocation alive (see
+/// [`HostAllocator::try_adopt`]), so install this only where buffer lifetimes are short
+/// relative to the source's eviction, e.g. scan-scoped reads over a caching object store.
+#[derive(Debug, Default)]
+pub struct AdoptingHostAllocator;
+
+impl HostAllocator for AdoptingHostAllocator {
+    fn allocate(&self, len: usize, alignment: Alignment) -> VortexResult<WritableHostBuffer> {
+        DefaultHostAllocator.allocate(len, alignment)
+    }
+
+    fn try_adopt(&self, bytes: &Bytes, alignment: Alignment) -> Option<ByteBuffer> {
+        (bytes.as_ptr().align_offset(*alignment) == 0)
+            .then(|| ByteBuffer::from_bytes_aligned(bytes.clone(), alignment))
     }
 }
 
@@ -383,5 +413,61 @@ mod tests {
         let err = writable.freeze_typed::<u32>().unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("not a multiple of"));
+    }
+
+    fn aligned_bytes(len: usize, alignment: Alignment) -> Bytes {
+        let mut writable = DefaultHostAllocator.allocate(len, alignment).unwrap();
+        writable.as_mut_slice().fill(7);
+        writable.freeze().into_inner()
+    }
+
+    #[test]
+    fn adopting_allocator_adopts_aligned_bytes() {
+        let alignment = Alignment::new(64);
+        let bytes = aligned_bytes(64, alignment);
+
+        let adopted = AdoptingHostAllocator
+            .try_adopt(&bytes, alignment)
+            .expect("aligned bytes must be adopted");
+        assert_eq!(adopted.as_ptr(), bytes.as_ptr());
+        assert!(adopted.is_aligned(alignment));
+        assert_eq!(adopted.as_slice(), bytes.as_ref());
+    }
+
+    #[test]
+    fn adopting_allocator_rejects_misaligned_bytes() {
+        let alignment = Alignment::new(64);
+        let misaligned = aligned_bytes(64, alignment).slice(1..);
+
+        assert!(
+            AdoptingHostAllocator
+                .try_adopt(&misaligned, alignment)
+                .is_none()
+        );
+        // Any pointer satisfies single-byte alignment.
+        assert!(
+            AdoptingHostAllocator
+                .try_adopt(&misaligned, Alignment::none())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn default_allocator_never_adopts() {
+        let bytes = aligned_bytes(64, Alignment::new(64));
+        assert!(
+            DefaultHostAllocator
+                .try_adopt(&bytes, Alignment::none())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn try_adopt_defaults_to_none() {
+        let allocator = CountingAllocator {
+            allocations: Arc::new(AtomicUsize::new(0)),
+        };
+        let bytes = aligned_bytes(64, Alignment::new(64));
+        assert!(allocator.try_adopt(&bytes, Alignment::none()).is_none());
     }
 }
