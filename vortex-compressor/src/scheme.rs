@@ -7,6 +7,7 @@ use std::fmt;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::hash::Hasher;
+use std::sync::Arc;
 
 use vortex_array::ArrayRef;
 use vortex_array::Canonical;
@@ -258,3 +259,73 @@ pub trait SchemeExt: Scheme {
 }
 
 impl<T: Scheme + ?Sized> SchemeExt for T {}
+
+/// Internal adapter so a `&'static dyn Scheme` can live inside an
+/// `Arc<dyn Scheme>` next to caller-owned `Arc<dyn Scheme>` schemes.
+///
+/// The cascading compressor stores its scheme list as `Vec<Arc<dyn Scheme>>`
+/// so callers can mix built-in static schemes with owned schemes (e.g. a
+/// pretrained-codec FSST variant created at session scope). `dyn Scheme`
+/// is not `Clone`, so a `&'static dyn Scheme` cannot be cloned directly
+/// into a heap-owned form; this wrapper provides that conversion at the
+/// cost of one extra v-table hop per method call. That hop is negligible
+/// against the work inside each scheme (statistics, sample compression,
+/// encode).
+#[derive(Debug)]
+struct StaticSchemeWrapper(&'static dyn Scheme);
+
+impl Scheme for StaticSchemeWrapper {
+    fn scheme_name(&self) -> &'static str {
+        self.0.scheme_name()
+    }
+
+    fn matches(&self, canonical: &Canonical) -> bool {
+        self.0.matches(canonical)
+    }
+
+    fn stats_options(&self) -> GenerateStatsOptions {
+        self.0.stats_options()
+    }
+
+    fn num_children(&self) -> usize {
+        self.0.num_children()
+    }
+
+    fn descendant_exclusions(&self) -> Vec<DescendantExclusion> {
+        self.0.descendant_exclusions()
+    }
+
+    fn ancestor_exclusions(&self) -> Vec<AncestorExclusion> {
+        self.0.ancestor_exclusions()
+    }
+
+    fn expected_compression_ratio(
+        &self,
+        data: &ArrayAndStats,
+        compress_ctx: CompressorContext,
+        exec_ctx: &mut ExecutionCtx,
+    ) -> CompressionEstimate {
+        self.0
+            .expected_compression_ratio(data, compress_ctx, exec_ctx)
+    }
+
+    fn compress(
+        &self,
+        compressor: &CascadingCompressor,
+        data: &ArrayAndStats,
+        compress_ctx: CompressorContext,
+        exec_ctx: &mut ExecutionCtx,
+    ) -> VortexResult<ArrayRef> {
+        self.0.compress(compressor, data, compress_ctx, exec_ctx)
+    }
+}
+
+/// Adapt a `&'static dyn Scheme` into the `Arc<dyn Scheme>` shape used by
+/// [`CascadingCompressor`]'s scheme list. Allocates one `Arc<StaticSchemeWrapper>`.
+///
+/// Callers that already own a `Arc<dyn Scheme>` (e.g. a pretrained-codec
+/// scheme created at session scope) pass it through unchanged; only
+/// built-in `&'static dyn Scheme` registrations need this conversion.
+pub fn arc_from_static_scheme(scheme: &'static dyn Scheme) -> Arc<dyn Scheme> {
+    Arc::new(StaticSchemeWrapper(scheme))
+}

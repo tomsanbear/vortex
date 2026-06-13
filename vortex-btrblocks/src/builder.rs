@@ -3,6 +3,9 @@
 
 //! Builder for configuring `BtrBlocksCompressor` instances.
 
+use std::sync::Arc;
+
+use vortex_compressor::scheme::arc_from_static_scheme;
 use vortex_utils::aliases::hash_set::HashSet;
 
 use crate::BtrBlocksCompressor;
@@ -95,13 +98,24 @@ pub const ALL_SCHEMES: &[&dyn Scheme] = &[
 /// ```
 #[derive(Debug, Clone)]
 pub struct BtrBlocksCompressorBuilder {
-    schemes: Vec<&'static dyn Scheme>,
+    /// Stored as `Arc<dyn Scheme>` rather than `&'static dyn Scheme` so the
+    /// builder can mix built-in static schemes with caller-owned schemes
+    /// whose state cannot live in static storage — for example, an FSST
+    /// variant carrying a pretrained `Arc<fsst::Compressor>` at session
+    /// scope. Built-in static schemes are converted via
+    /// [`vortex_compressor::scheme::arc_from_static_scheme`] at the entry
+    /// points that accept `&'static dyn Scheme`.
+    schemes: Vec<Arc<dyn Scheme>>,
 }
 
 impl Default for BtrBlocksCompressorBuilder {
     fn default() -> Self {
         Self {
-            schemes: ALL_SCHEMES.to_vec(),
+            schemes: ALL_SCHEMES
+                .iter()
+                .copied()
+                .map(arc_from_static_scheme)
+                .collect(),
         }
     }
 }
@@ -116,15 +130,34 @@ impl BtrBlocksCompressorBuilder {
         }
     }
 
-    /// Adds an external compression scheme not in [`ALL_SCHEMES`].
+    /// Adds an external static compression scheme not in [`ALL_SCHEMES`].
     ///
     /// This allows encoding crates outside of `vortex-btrblocks` to register their own schemes
-    /// with the compressor.
+    /// with the compressor. The static reference is wrapped via
+    /// [`vortex_compressor::scheme::arc_from_static_scheme`] so it can coexist with caller-owned
+    /// schemes added through [`Self::with_new_scheme_arc`].
     ///
     /// # Panics
     ///
     /// Panics if a scheme with the same [`SchemeId`] is already present.
-    pub fn with_new_scheme(mut self, scheme: &'static dyn Scheme) -> Self {
+    pub fn with_new_scheme(self, scheme: &'static dyn Scheme) -> Self {
+        self.with_new_scheme_arc(arc_from_static_scheme(scheme))
+    }
+
+    /// Adds an owned compression scheme not in [`ALL_SCHEMES`].
+    ///
+    /// Use this when the scheme cannot live behind a `&'static` reference — for
+    /// example, a `FSSTSchemeWithPretrained` carrying a per-session
+    /// `Arc<fsst::Compressor>` so consecutive fragment writes of the same column
+    /// can skip the FSST symbol-table training that would otherwise dominate
+    /// streaming-ingest CPU. Static built-in schemes registered through the
+    /// `&'static dyn Scheme` entry point ([`Self::with_new_scheme`]) coexist
+    /// transparently with owned schemes in the same builder.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a scheme with the same [`SchemeId`] is already present.
+    pub fn with_new_scheme_arc(mut self, scheme: Arc<dyn Scheme>) -> Self {
         assert!(
             !self.schemes.iter().any(|s| s.id() == scheme.id()),
             "scheme {:?} is already present in the builder",
@@ -219,7 +252,7 @@ impl BtrBlocksCompressorBuilder {
 
     /// Builds the configured [`BtrBlocksCompressor`].
     pub fn build(self) -> BtrBlocksCompressor {
-        BtrBlocksCompressor(CascadingCompressor::new(self.schemes))
+        BtrBlocksCompressor(CascadingCompressor::with_owned_schemes(self.schemes))
     }
 }
 
