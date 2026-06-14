@@ -7,6 +7,7 @@ use std::ops::Deref;
 
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
+use vortex_compressor::ctx::CompressorContext;
 use vortex_error::VortexResult;
 
 use crate::BtrBlocksCompressorBuilder;
@@ -41,6 +42,26 @@ impl BtrBlocksCompressor {
     /// Compresses an array using BtrBlocks-inspired compression.
     pub fn compress(&self, array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
         self.0.compress(array, ctx)
+    }
+
+    /// Compresses an array using a caller-supplied [`CompressorContext`].
+    ///
+    /// Pass-through to
+    /// [`CascadingCompressor::compress_with_ctx`](crate::CascadingCompressor::compress_with_ctx).
+    /// Useful for callers that want to attach a
+    /// [`with_frozen_scheme`](CompressorContext::with_frozen_scheme) hint
+    /// from a previously-observed scheme winner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if canonicalization or compression fails.
+    pub fn compress_with_ctx(
+        &self,
+        array: &ArrayRef,
+        compress_ctx: CompressorContext,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<ArrayRef> {
+        self.0.compress_with_ctx(array, compress_ctx, ctx)
     }
 }
 
