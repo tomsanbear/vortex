@@ -64,12 +64,6 @@ impl Scheme for FSSTScheme {
         compress_ctx: CompressorContext,
         exec_ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static CALLS: AtomicU64 = AtomicU64::new(0);
-        let n = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
-        if n.is_power_of_two() {
-            tracing::info!(target: "fsst_diag", count = n, "FSSTScheme(default)::compress invoked");
-        }
         let utf8 = data.array_as_varbinview().into_owned();
         let compressor_fsst = fsst_train_compressor(&utf8);
         let fsst = fsst_compress(&utf8, utf8.len(), utf8.dtype(), &compressor_fsst, exec_ctx);
