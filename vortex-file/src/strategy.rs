@@ -150,6 +150,12 @@ pub struct WriteStrategyBuilder {
     field_compressors: HashMap<FieldPath, Arc<dyn CompressorPlugin>>,
     allow_encodings: Option<HashSet<ArrayId>>,
     flat_strategy: Option<Arc<dyn LayoutStrategy>>,
+    /// Optional override for the per-chunk stats that
+    /// `CompressingStrategy` pre-computes before each compression
+    /// call. `None` keeps the default of [`Stat::all()`]; callers
+    /// that know their scheme set never reads certain stats can
+    /// narrow this to skip the corresponding per-fragment scans.
+    compressing_stats: Option<Arc<[vortex_array::expr::stats::Stat]>>,
 }
 
 impl Default for WriteStrategyBuilder {
@@ -163,6 +169,7 @@ impl Default for WriteStrategyBuilder {
             field_compressors: HashMap::new(),
             allow_encodings: Some(ALLOWED_ENCODINGS.clone()),
             flat_strategy: None,
+            compressing_stats: None,
         }
     }
 }
@@ -214,6 +221,25 @@ impl WriteStrategyBuilder {
     /// The compressor is used as-is for both data and stats compression.
     pub fn with_compressor<C: CompressorPlugin>(mut self, compressor: C) -> Self {
         self.compressor = CompressorConfig::Opaque(Arc::new(compressor));
+        self
+    }
+
+    /// Override the per-chunk stats that the leaf `CompressingStrategy`
+    /// pre-computes before each compression call.
+    ///
+    /// Defaults to [`Stat::all()`](vortex_array::expr::stats::Stat::all),
+    /// which costs a per-fragment scan for every stat in the enum (some
+    /// share a single scan, some don't). Callers whose scheme set
+    /// reads only a subset can narrow this to skip the
+    /// `IsSorted`/`IsStrictSorted`/`UncompressedSizeInBytes`/`Sum`/
+    /// `NaNCount` scans (or any other unused stat). The narrowed set
+    /// is shared by both the fallback chain and every per-field
+    /// override.
+    pub fn with_compressing_stats(
+        mut self,
+        stats: impl IntoIterator<Item = vortex_array::expr::stats::Stat>,
+    ) -> Self {
+        self.compressing_stats = Some(stats.into_iter().collect());
         self
     }
 
@@ -275,13 +301,17 @@ impl WriteStrategyBuilder {
         // composition) parameterised on which `CompressorPlugin` to plug
         // into the leaf `CompressingStrategy`. The chain is identical
         // shape for every field; only the data compressor varies.
+        let compressing_stats = self.compressing_stats.clone();
         let build_field_chain = |data_compressor: Arc<dyn CompressorPlugin>| -> Arc<dyn LayoutStrategy> {
             // 7. for each chunk create a flat layout
             let chunked = ChunkedLayoutStrategy::new(Arc::clone(&flat));
             // 6. buffer chunks so they end up with closer segment ids physically
             let buffered = BufferedStrategy::new(chunked, 2 * ONE_MEG); // 2MB
 
-            let compressing = CompressingStrategy::new(buffered, Arc::clone(&data_compressor));
+            let mut compressing = CompressingStrategy::new(buffered, Arc::clone(&data_compressor));
+            if let Some(stats) = compressing_stats.as_deref() {
+                compressing = compressing.with_stats(stats);
+            }
 
             // 4. prior to compression, coalesce up to a minimum size
             let coalescing = RepartitionStrategy::new(
