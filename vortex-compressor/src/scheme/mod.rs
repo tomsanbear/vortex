@@ -7,6 +7,7 @@
 mod ctx;
 pub use ctx::CompressorContext;
 pub use ctx::MAX_CASCADE;
+pub use ctx::WinnerObserver;
 
 pub(crate) mod estimate;
 mod exclusion;

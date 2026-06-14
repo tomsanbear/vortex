@@ -4,12 +4,29 @@
 //! Compression context for recursive compression.
 
 use std::fmt;
+use std::sync::Arc;
 
 use vortex_error::VortexExpect;
 
 use crate::compressor::ROOT_SCHEME_ID;
 use crate::scheme::SchemeId;
 use crate::stats::GenerateStatsOptions;
+
+/// Caller-supplied hook invoked when [`choose_and_compress`] determines a
+/// winning scheme at this compression site.
+///
+/// Fires after selection (or short-circuit via a frozen-scheme hint) but
+/// before the scheme's `compress` runs, so a failing compress does not
+/// suppress the observation. The argument is the winner's
+/// [`SchemeId`].
+///
+/// Useful for downstream consumers that want to build a per-column or
+/// per-fragment cache of winners (the natural input to a future
+/// [`with_frozen_scheme`](CompressorContext::with_frozen_scheme) hint
+/// supplied on the next compression of the same column).
+///
+/// [`choose_and_compress`]: crate::compressor::CascadingCompressor
+pub type WinnerObserver = Arc<dyn Fn(SchemeId) + Send + Sync>;
 
 // TODO(connor): Why is this 3??? This doesn't seem smart or adaptive.
 /// Maximum cascade depth for compression.
@@ -19,7 +36,7 @@ pub const MAX_CASCADE: usize = 3;
 ///
 /// Tracks the cascade history (which schemes and child indices have been applied in the current
 /// chain) so the compressor can enforce exclusion rules and prevent cycles.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CompressorContext {
     /// Whether we're compressing a sample (for ratio estimation).
     is_sample: bool,
@@ -61,6 +78,37 @@ pub struct CompressorContext {
     /// the chosen scheme's compress go through normal selection unless a
     /// fresh hint is set on the descended context.
     frozen_scheme: Option<SchemeId>,
+
+    /// Caller-supplied observer notified of the winning scheme at this
+    /// compression site. Dropped on descent so the observer fires only
+    /// at the level the caller installed it at.
+    winner_observer: Option<WinnerObserver>,
+}
+
+impl fmt::Debug for CompressorContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // `WinnerObserver` is `Arc<dyn Fn(SchemeId)>` and does not impl
+        // `Debug`; elide it with a presence marker so the rest of the
+        // context still renders for diagnostics.
+        f.debug_struct("CompressorContext")
+            .field("is_sample", &self.is_sample)
+            .field("allowed_cascading", &self.allowed_cascading)
+            .field("merged_stats_options", &self.merged_stats_options)
+            .field("cascade_history", &self.cascade_history)
+            .field("frozen_scheme", &self.frozen_scheme)
+            .field(
+                "winner_observer",
+                &format_args!(
+                    "{}",
+                    if self.winner_observer.is_some() {
+                        "<installed>"
+                    } else {
+                        "<none>"
+                    }
+                ),
+            )
+            .finish()
+    }
 }
 
 impl CompressorContext {
@@ -74,6 +122,7 @@ impl CompressorContext {
             merged_stats_options: GenerateStatsOptions::default(),
             cascade_history: Vec::new(),
             frozen_scheme: None,
+            winner_observer: None,
         }
     }
 }
@@ -149,6 +198,11 @@ impl CompressorContext {
     /// almost every layout. Callers that want to fix a descendant's
     /// scheme too must set it explicitly via [`with_frozen_scheme`] on
     /// the returned context.
+    ///
+    /// The winner observer is dropped here for the same reason: it
+    /// applies only at the level the caller installed it at; firing it
+    /// for every descendant would conflate per-column winners with
+    /// per-(child of winner) cascading winners.
     pub(crate) fn descend_with_scheme(mut self, id: SchemeId, child_index: usize) -> Self {
         self.allowed_cascading = self
             .allowed_cascading
@@ -156,6 +210,7 @@ impl CompressorContext {
             .vortex_expect("cannot descend: cascade depth exhausted");
         self.cascade_history.push((id, child_index));
         self.frozen_scheme = None;
+        self.winner_observer = None;
         self
     }
 
@@ -177,6 +232,22 @@ impl CompressorContext {
     #[must_use]
     pub fn with_frozen_scheme(mut self, scheme_id: SchemeId) -> Self {
         self.frozen_scheme = Some(scheme_id);
+        self
+    }
+
+    /// Returns the caller-supplied winner observer, if any.
+    pub fn winner_observer(&self) -> Option<&WinnerObserver> {
+        self.winner_observer.as_ref()
+    }
+
+    /// Sets an observer that fires when the cascade determines a winner
+    /// at this compression site (whether via the
+    /// [`with_frozen_scheme`](Self::with_frozen_scheme) fast path or
+    /// via normal selection). The observer is dropped on cascade
+    /// descent so it fires only at the level the caller installed it.
+    #[must_use]
+    pub fn with_winner_observer(mut self, observer: WinnerObserver) -> Self {
+        self.winner_observer = Some(observer);
         self
     }
 }

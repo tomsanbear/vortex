@@ -43,6 +43,8 @@ use crate::scheme::EstimateScore;
 use crate::scheme::EstimateVerdict;
 use crate::scheme::Scheme;
 use crate::scheme::SchemeExt;
+use crate::scheme::SchemeId;
+use crate::scheme::WinnerObserver;
 use crate::stats::ArrayAndStats;
 use crate::stats::GenerateStatsOptions;
 
@@ -962,6 +964,74 @@ fn frozen_scheme_falls_through_when_unregistered() -> VortexResult<()> {
     assert!(
         *invoked.lock(),
         "unregistered hint must fall through to normal selection"
+    );
+    Ok(())
+}
+
+/// `CompressorContext::with_winner_observer` fires the supplied callback with the winning
+/// scheme's `SchemeId` after selection (or after the frozen-scheme fast path picks one) and
+/// before the scheme's `compress` runs. The callback receives the winner even if `compress`
+/// later fails — observation is decoupled from success.
+#[test]
+fn winner_observer_fires_with_chosen_scheme_id() -> VortexResult<()> {
+    let recorded: Arc<Mutex<Option<SchemeId>>> = Arc::new(Mutex::new(None));
+    let observer = {
+        let recorded = Arc::clone(&recorded);
+        Arc::new(move |id: SchemeId| {
+            *recorded.lock() = Some(id);
+        }) as WinnerObserver
+    };
+    let compressor =
+        CascadingCompressor::new(vec![&IntDictScheme, &FloatDictScheme, &StringDictScheme]);
+    // Non-constant, low-cardinality data: a constant array would short-circuit into the
+    // compressor's built-in constant detection before any scheme selection, and the
+    // observer only reports scheme wins.
+    let array = PrimitiveArray::new(
+        buffer![1i32, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2],
+        Validity::NonNullable,
+    )
+    .into_array();
+    let ctx = CompressorContext::new().with_winner_observer(observer);
+    let mut exec_ctx = SESSION.create_execution_ctx();
+    drop(compressor.compress_with_ctx(&array, ctx, &mut exec_ctx)?);
+    let got = *recorded.lock();
+    assert_eq!(
+        got,
+        Some(IntDictScheme.id()),
+        "the observer must receive the winner the cascade picked"
+    );
+    Ok(())
+}
+
+/// The observer is dropped on cascade descent so it fires only at the level the caller
+/// installed it. We exercise this indirectly by checking the observer fires exactly once for a
+/// top-level integer column (whose winner has children — `DictArray` has `codes` and `values` —
+/// that would fire their own observer if the hint were inherited).
+#[test]
+fn winner_observer_fires_only_at_root_level() -> VortexResult<()> {
+    let call_count = Arc::new(Mutex::new(0usize));
+    let observer = {
+        let call_count = Arc::clone(&call_count);
+        Arc::new(move |_id: SchemeId| {
+            *call_count.lock() += 1;
+        }) as WinnerObserver
+    };
+    let compressor =
+        CascadingCompressor::new(vec![&IntDictScheme, &FloatDictScheme, &StringDictScheme]);
+    // Non-constant, low-cardinality data so scheme selection actually runs (see
+    // `winner_observer_fires_with_chosen_scheme_id`) and the winner (Dict) has children.
+    let array = PrimitiveArray::new(
+        buffer![1i32, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2],
+        Validity::NonNullable,
+    )
+    .into_array();
+    let ctx = CompressorContext::new().with_winner_observer(observer);
+    let mut exec_ctx = SESSION.create_execution_ctx();
+    drop(compressor.compress_with_ctx(&array, ctx, &mut exec_ctx)?);
+    assert_eq!(
+        *call_count.lock(),
+        1,
+        "observer must fire exactly once at the root cascade level"
     );
     Ok(())
 }

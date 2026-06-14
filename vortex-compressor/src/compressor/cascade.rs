@@ -291,6 +291,9 @@ impl CascadingCompressor {
             }
             let before_nbytes = array.nbytes();
             let opts = frozen.stats_options();
+            if let Some(observer) = compress_ctx.winner_observer() {
+                observer(frozen.id());
+            }
             let compress_ctx = compress_ctx.with_merged_stats_options(opts);
             let data = ArrayAndStats::new(array, opts);
             let error_ctx = trace::enabled_error_context(&compress_ctx);
@@ -377,6 +380,10 @@ impl CascadingCompressor {
         else {
             return Ok(data.into_array());
         };
+
+        if let Some(observer) = compress_ctx.winner_observer() {
+            observer(winner.id());
+        }
 
         // Run the winning scheme's `compress`. On failure, emit an ERROR event carrying the
         // scheme name and cascade history before propagating.
