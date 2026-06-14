@@ -244,7 +244,7 @@ impl WriteStrategyBuilder {
             ),
             CompressorConfig::Opaque(compressor) => Arc::clone(compressor),
         };
-        let compressing = CompressingStrategy::new(buffered, data_compressor);
+        let compressing = CompressingStrategy::new(buffered, Arc::clone(&data_compressor));
 
         // 4. prior to compression, coalesce up to a minimum size
         let coalescing = RepartitionStrategy::new(
@@ -271,12 +271,21 @@ impl WriteStrategyBuilder {
         let compress_then_flat = CompressingStrategy::new(flat, stats_compressor);
 
         // 3. apply dict encoding or fallback
+        //
+        // The dict probe (DictStrategy's first-chunk check) reuses the data_compressor
+        // so any pre-trained codec state (e.g. an FSSTSchemeWithPretrained variant
+        // installed via BtrBlocksCompressorBuilder::with_new_scheme_arc) flows into the
+        // probe instead of being silently replaced with a stock BtrBlocksCompressor that
+        // re-trains FSST symbol tables on every probe. Without this, the probe runs
+        // FSST training per chunk on every string column even when the data path is
+        // configured to skip training — wiping out the streaming-ingest win.
         let dict = DictStrategy::new(
             coalescing.clone(),
             compress_then_flat.clone(),
             coalescing,
             Default::default(),
-        );
+        )
+        .with_probe_compressor(Arc::clone(&data_compressor));
 
         // 2. calculate stats for each row group
         let stats = ZonedStrategy::new(
