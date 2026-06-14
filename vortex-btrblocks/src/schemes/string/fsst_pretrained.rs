@@ -140,6 +140,12 @@ impl Scheme for FSSTSchemeWithPretrained {
         compress_ctx: CompressorContext,
         exec_ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+        let n = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::info!(target: "fsst_diag", count = n, "FSSTSchemeWithPretrained::compress invoked");
+        }
         let utf8 = data.array_as_varbinview().into_owned();
         // The single difference from `FSSTScheme::compress`: instead of
         // `fsst_train_compressor(&utf8)`, reuse `self.pretrained`. The
