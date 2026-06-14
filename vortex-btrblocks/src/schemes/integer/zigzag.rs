@@ -108,10 +108,26 @@ impl Scheme for ZigZagScheme {
         if compress_ctx.finished_cascading() {
             return CompressionEstimate::Verdict(EstimateVerdict::Skip);
         }
-        let stats = data.integer_stats(exec_ctx);
 
-        // ZigZag is only useful when there are negative values.
-        if !stats.erased().min_is_negative() {
+        // ZigZag is only useful when there are negative values. Read
+        // `min` directly from the array's stats cache rather than
+        // triggering the full `IntegerStats` compute via
+        // `data.integer_stats`: the cache is populated by
+        // `CompressingStrategy`'s `compute_all(&Stat::all(), ...)`
+        // before any scheme's estimate runs, so this is `O(1)` on a
+        // cache hit. Mirrors the bitpacking and FoR gate
+        // direct-stats-read pattern.
+        let primitive = data.array_as_primitive();
+        let array_ref = primitive.as_ref();
+        #[allow(unused_comparisons, clippy::absurd_extreme_comparisons)]
+        let min_is_negative = vortex_array::match_each_integer_ptype!(primitive.ptype(), |P| {
+            array_ref
+                .statistics()
+                .compute_min::<P>(exec_ctx)
+                .unwrap_or_default()
+                < 0
+        });
+        if !min_is_negative {
             return CompressionEstimate::Verdict(EstimateVerdict::Skip);
         }
 
