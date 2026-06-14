@@ -349,11 +349,28 @@ impl CascadingCompressor {
         // `choose_best_scheme` dispatch. Stats are generated from the
         // chosen scheme's own [`Scheme::stats_options`] only.
         //
-        // On miss (id not registered, scheme refuses the canonical type
-        // via its [`matches`] check, or the cascade's exclusion rules
-        // would otherwise skip it) the path falls through to normal
-        // selection. A stale or wrong hint never produces an incorrect
-        // compressed output; the worst case is one wasted lookup.
+        // The scheme's own
+        // [`expected_compression_ratio`](Scheme::expected_compression_ratio)
+        // is still consulted on the fast path: if the verdict is
+        // [`EstimateVerdict::Skip`] the cascade falls through to
+        // normal selection. This guards against shape-fragile schemes
+        // (BitPacking on signed-negative input, FoR on wrap-overflow
+        // spans, the constant family on actually-non-constant data)
+        // whose [`matches`] returns `true` but whose compress would
+        // panic on the canonical input — the cached winner from a
+        // prior fragment may not fit the current one.
+        // [`DeferredEstimate`] verdicts proceed as cache hits without
+        // running the sample compress; if the cached winner turns out
+        // to be a poor choice the cascade's accept-only-if-smaller
+        // guard still falls back to the canonical encoding.
+        //
+        // On miss (id not registered, scheme refuses the canonical
+        // type via its [`matches`] check, the cascade's exclusion
+        // rules would otherwise skip it, or `expected_compression_ratio`
+        // returns `Skip`) the path falls through to normal selection.
+        // A stale or wrong hint never produces an incorrect compressed
+        // output; the worst case is one wasted lookup plus one
+        // `expected_compression_ratio` call.
         if let Some(frozen_id) = compress_ctx.frozen_scheme() {
             if let Some(frozen) = self
                 .schemes
@@ -365,7 +382,7 @@ impl CascadingCompressor {
                 })
                 .cloned()
             {
-                let array: ArrayRef = canonical.into();
+                let array: ArrayRef = canonical.clone().into();
                 if array.is_empty() {
                     return Ok(array);
                 }
@@ -378,31 +395,75 @@ impl CascadingCompressor {
                 }
                 let before_nbytes = array.nbytes();
                 let opts = frozen.stats_options();
-                if let Some(observer) = compress_ctx.winner_observer() {
-                    observer(frozen.id());
-                }
-                let compress_ctx = compress_ctx.with_merged_stats_options(opts);
+                // One `ArrayAndStats` is shared between the probe call
+                // (expected_compression_ratio) and the compress call.
+                // The per-instance stats cache holds the lazy
+                // `integer_stats` / `varbinview_stats` so the probe's
+                // generation amortises into the compress's. Earlier
+                // shape of this code constructed two separate
+                // `ArrayAndStats`, paying the stats compute twice and
+                // measurably regressing streaming-insert wall-clock vs
+                // the pre-gate shape.
                 let data = ArrayAndStats::new(array, opts);
-                let error_ctx = trace::enabled_error_context(&compress_ctx);
-                let _winner_span = trace::winner_compress_span(frozen.id(), before_nbytes).entered();
-                let compressed = frozen
-                    .compress(self, &data, compress_ctx, exec_ctx)
-                    .inspect_err(|err| {
-                        trace::scheme_compress_failed(
-                            frozen.id(),
-                            before_nbytes,
-                            error_ctx.as_ref(),
-                            err,
-                        );
-                    })?;
-                let after_nbytes = compressed.nbytes();
-                let accepted = after_nbytes < before_nbytes || compressed.is::<AnyScalarFn>();
-                trace::record_winner_compress_result(after_nbytes, None, None, accepted);
-                return Ok(if accepted {
-                    compressed
-                } else {
-                    data.into_array()
-                });
+                let estimate = frozen.expected_compression_ratio(
+                    &data,
+                    compress_ctx.clone(),
+                    exec_ctx,
+                );
+                // Verdict::Skip falls through to normal selection (the
+                // shape-fragility fence).
+                // Verdict::Ratio and Verdict::AlwaysUse take the fast
+                // path directly.
+                // Deferred::Sample takes the fast path because the
+                // sample's only role in normal selection is producing
+                // a ratio estimate for comparison against other
+                // candidates; we already have a winner via the cache
+                // hit, so the comparison is moot and skipping the
+                // sample is exactly the C-prime saving — the
+                // accept-only-if-smaller guard still catches the case
+                // where the scheme's full compress doesn't actually
+                // shrink the input.
+                // Deferred::Callback falls through because the callback
+                // is the actual correctness check, not just a ratio
+                // estimate. StringConstantScheme's Callback runs
+                // `is_constant` and returns Skip on non-constant data;
+                // bypassing the callback in the fast path would land
+                // the non-constant array on the constant scheme's
+                // compress and corrupt every row to the first scalar.
+                let fast_path_ok = match estimate {
+                    CompressionEstimate::Verdict(EstimateVerdict::Skip) => false,
+                    CompressionEstimate::Verdict(EstimateVerdict::AlwaysUse) => true,
+                    CompressionEstimate::Verdict(EstimateVerdict::Ratio(_)) => true,
+                    CompressionEstimate::Deferred(DeferredEstimate::Sample) => true,
+                    CompressionEstimate::Deferred(DeferredEstimate::Callback(_)) => false,
+                };
+                if fast_path_ok {
+                    if let Some(observer) = compress_ctx.winner_observer() {
+                        observer(frozen.id());
+                    }
+                    let compress_ctx = compress_ctx.with_merged_stats_options(opts);
+                    let error_ctx = trace::enabled_error_context(&compress_ctx);
+                    let _winner_span =
+                        trace::winner_compress_span(frozen.id(), before_nbytes).entered();
+                    let compressed = frozen
+                        .compress(self, &data, compress_ctx, exec_ctx)
+                        .inspect_err(|err| {
+                            trace::scheme_compress_failed(
+                                frozen.id(),
+                                before_nbytes,
+                                error_ctx.as_ref(),
+                                err,
+                            );
+                        })?;
+                    let after_nbytes = compressed.nbytes();
+                    let accepted = after_nbytes < before_nbytes || compressed.is::<AnyScalarFn>();
+                    trace::record_winner_compress_result(after_nbytes, None, None, accepted);
+                    return Ok(if accepted {
+                        compressed
+                    } else {
+                        data.into_array()
+                    });
+                }
             }
         }
 
