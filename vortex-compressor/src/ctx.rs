@@ -38,6 +38,29 @@ pub struct CompressorContext {
     /// [`descendant_exclusions`]: crate::scheme::Scheme::descendant_exclusions
     /// [`ancestor_exclusions`]: crate::scheme::Scheme::ancestor_exclusions
     cascade_history: Vec<(SchemeId, usize)>,
+
+    /// Caller-supplied scheme winner for this compression site, if known
+    /// upfront.
+    ///
+    /// When `Some(id)` and a scheme with that id is registered and
+    /// applicable to the canonical input, the compressor skips scheme
+    /// selection: the merged stats-options fold and the two-pass
+    /// [`choose_best_scheme`](crate::compressor::CascadingCompressor)
+    /// dispatch are bypassed, and the chosen scheme's compress runs
+    /// directly. Stats are derived from THAT scheme's own
+    /// [`Scheme::stats_options`](crate::scheme::Scheme::stats_options),
+    /// so any per-scheme stats that selection would have computed only
+    /// to discard are never generated.
+    ///
+    /// On mismatch (id not registered, or the scheme refuses the
+    /// canonical type, or the cascade's exclusion rules apply at this
+    /// position), the cascade falls through to its normal selection
+    /// path — safe in the face of a stale hint.
+    ///
+    /// The hint applies to the current level only. Children produced by
+    /// the chosen scheme's compress go through normal selection unless a
+    /// fresh hint is set on the descended context.
+    frozen_scheme: Option<SchemeId>,
 }
 
 impl CompressorContext {
@@ -50,6 +73,7 @@ impl CompressorContext {
             allowed_cascading: MAX_CASCADE,
             merged_stats_options: GenerateStatsOptions::default(),
             cascade_history: Vec::new(),
+            frozen_scheme: None,
         }
     }
 }
@@ -118,12 +142,41 @@ impl CompressorContext {
     ///
     /// The `child_index` identifies which child of the scheme is being compressed (e.g. for
     /// Dict: values=0, codes=1).
+    ///
+    /// Any caller-supplied scheme winner is dropped on descent. The hint
+    /// applies at one cascade level only; carrying it to children would
+    /// force the same id to win at every depth, which is wrong for
+    /// almost every layout. Callers that want to fix a descendant's
+    /// scheme too must set it explicitly via [`with_frozen_scheme`] on
+    /// the returned context.
     pub(super) fn descend_with_scheme(mut self, id: SchemeId, child_index: usize) -> Self {
         self.allowed_cascading = self
             .allowed_cascading
             .checked_sub(1)
             .vortex_expect("cannot descend: cascade depth exhausted");
         self.cascade_history.push((id, child_index));
+        self.frozen_scheme = None;
+        self
+    }
+
+    /// Returns the caller-supplied scheme winner for this compression
+    /// site, if any.
+    pub fn frozen_scheme(&self) -> Option<SchemeId> {
+        self.frozen_scheme
+    }
+
+    /// Sets a scheme winner for this compression site. When the chosen
+    /// scheme is registered and applicable to the canonical input, the
+    /// cascade bypasses its selection pass and dispatches directly to
+    /// it. Otherwise the cascade falls through to normal selection.
+    ///
+    /// Intended for callers that have observed the winning scheme on a
+    /// prior, structurally-equivalent array (e.g. consecutive fragments
+    /// of the same column in a streaming writer) and want to avoid the
+    /// per-call selection + stats-merge work.
+    #[must_use]
+    pub fn with_frozen_scheme(mut self, scheme_id: SchemeId) -> Self {
+        self.frozen_scheme = Some(scheme_id);
         self
     }
 }
