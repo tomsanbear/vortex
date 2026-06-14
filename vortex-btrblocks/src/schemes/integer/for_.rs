@@ -16,7 +16,6 @@ use vortex_compressor::estimate::CompressionEstimate;
 use vortex_compressor::estimate::EstimateVerdict;
 use vortex_compressor::scheme::AncestorExclusion;
 use vortex_compressor::scheme::ChildSelection;
-use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_fastlanes::FoR;
 use vortex_fastlanes::FoRArrayExt;
@@ -74,15 +73,38 @@ impl Scheme for FoRScheme {
         if compress_ctx.finished_cascading() {
             return CompressionEstimate::Verdict(EstimateVerdict::Skip);
         }
-        let stats = data.integer_stats(exec_ctx);
+        // Read `min` and `max` directly from the array's stats cache
+        // rather than triggering the full `IntegerStats` compute via
+        // `data.integer_stats`: the cache is populated by
+        // `CompressingStrategy`'s `compute_all(&Stat::all(), ...)`
+        // before any scheme's estimate runs, so this is `O(1)` on a
+        // cache hit. FoR's own `compress` doesn't read `IntegerStats`
+        // either, so paying the full compute here is pure waste on
+        // the freeze fast path that the C-prime per-column cache is
+        // supposed to accelerate. Mirrors the bitpacking gate's
+        // direct-stats-read pattern.
+        let primitive = data.array_as_primitive();
+        let array_ref = primitive.as_ref();
+        let full_width = primitive.ptype().bit_width() as u32;
+        #[allow(unused_comparisons, clippy::absurd_extreme_comparisons)]
+        let (min_is_zero, min_is_negative, max_minus_min, max_value_u128) =
+            vortex_array::match_each_integer_ptype!(primitive.ptype(), |P| {
+                let stats_set = array_ref.statistics();
+                let min = stats_set.compute_min::<P>(exec_ctx).unwrap_or_default();
+                let max = stats_set.compute_max::<P>(exec_ctx).unwrap_or_default();
+                let min_i128 = min as i128;
+                let max_i128 = max as i128;
+                let diff = (max_i128 - min_i128) as u128;
+                (min == 0, min < 0, diff, max_i128 as u128)
+            });
 
         // Only apply when the min is not already zero.
-        if stats.erased().min_is_zero() {
+        if min_is_zero {
             return CompressionEstimate::Verdict(EstimateVerdict::Skip);
         }
 
         // Difference between max and min.
-        let for_bitwidth = match stats.erased().max_minus_min().checked_ilog2() {
+        let for_bitwidth = match max_minus_min.checked_ilog2() {
             Some(l) => l + 1,
             // If max-min == 0, the we should be compressing this as a constant array.
             None => return CompressionEstimate::Verdict(EstimateVerdict::Skip),
@@ -99,36 +121,24 @@ impl Scheme for FoRScheme {
         // (`for_bitwidth == full_width`), so refusing here costs no
         // realistic compression while keeping the bitpack precondition
         // intact for the cascade's other consumers.
-        let signed_full_width = data
-            .array_as_primitive()
-            .ptype()
-            .bit_width()
-            .saturating_sub(1) as u32;
-        if data.array_as_primitive().ptype().is_signed_int() && for_bitwidth > signed_full_width {
+        let signed_full_width = full_width.saturating_sub(1);
+        if primitive.ptype().is_signed_int() && for_bitwidth > signed_full_width {
             return CompressionEstimate::Verdict(EstimateVerdict::Skip);
         }
 
         // If BitPacking can be applied (only non-negative values) and FoR doesn't reduce bit width
         // compared to BitPacking, don't use FoR since it has a small amount of overhead (storing
-        // the reference) for effectively no benefits.
-        if let Some(max_log) = stats
-            .erased()
-            .max_ilog2()
-            // Only skip FoR when min >= 0, otherwise BitPacking can't be applied without ZigZag.
-            .filter(|_| !stats.erased().min_is_negative())
-        {
-            let bitpack_bitwidth = max_log + 1;
-            if for_bitwidth >= bitpack_bitwidth {
-                return CompressionEstimate::Verdict(EstimateVerdict::Skip);
+        // the reference) for effectively no benefits. Only consult when
+        // min >= 0 because BitPacking can't be applied without ZigZag
+        // otherwise.
+        if !min_is_negative {
+            if let Some(max_log) = max_value_u128.checked_ilog2() {
+                let bitpack_bitwidth = max_log + 1;
+                if for_bitwidth >= bitpack_bitwidth {
+                    return CompressionEstimate::Verdict(EstimateVerdict::Skip);
+                }
             }
         }
-
-        let full_width: u32 = data
-            .array_as_primitive()
-            .ptype()
-            .bit_width()
-            .try_into()
-            .vortex_expect("bit width must fit in u32");
 
         CompressionEstimate::Verdict(EstimateVerdict::Ratio(
             full_width as f64 / for_bitwidth as f64,
