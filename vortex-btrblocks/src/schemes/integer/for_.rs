@@ -134,6 +134,13 @@ impl Scheme for FoRScheme {
         // NOTE: we could delegate in the future if we had another downstream codec that performs
         //  as well.
         let leaf_ctx = compress_ctx.clone().as_leaf();
+        // DIAGNOSTIC
+        eprintln!(
+            "FOR COMPRESS: ptype={:?} biased_len={} reference_scalar={:?}",
+            biased.ptype(),
+            biased.len(),
+            for_array.reference_scalar(),
+        );
         let biased_data =
             ArrayAndStats::new(biased.into_array(), compress_ctx.merged_stats_options());
         let compressed = BitPackingScheme.compress(compressor, &biased_data, leaf_ctx, exec_ctx)?;
