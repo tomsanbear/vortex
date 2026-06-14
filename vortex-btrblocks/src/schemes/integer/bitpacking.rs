@@ -44,10 +44,28 @@ impl Scheme for BitPackingScheme {
         _compress_ctx: CompressorContext,
         exec_ctx: &mut ExecutionCtx,
     ) -> CompressionEstimate {
-        let stats = data.integer_stats(exec_ctx);
-
-        // BitPacking only works for non-negative values.
-        if stats.erased().min_is_negative() {
+        // BitPacking only works for non-negative values. Read `min`
+        // directly from the array's stats cache rather than triggering
+        // the full `IntegerStats` compute via `data.integer_stats`:
+        // the cache is populated by `CompressingStrategy`'s
+        // `compute_all(&Stat::all(), ...)` before any scheme's
+        // estimate runs, so this is `O(1)` on a cache hit (the common
+        // path for repeat fragments) and `min_max` on a cold miss.
+        // Bitpacking's `compress` runs `bit_width_histogram` directly
+        // and doesn't read `IntegerStats`, so paying the full compute
+        // here is pure waste on the freeze fast path that the
+        // C-prime per-column cache is supposed to accelerate.
+        let primitive = data.array_as_primitive();
+        let array_ref = primitive.as_ref();
+        #[allow(unused_comparisons, clippy::absurd_extreme_comparisons)]
+        let min_is_negative = vortex_array::match_each_integer_ptype!(primitive.ptype(), |P| {
+            array_ref
+                .statistics()
+                .compute_min::<P>(exec_ctx)
+                .unwrap_or_default()
+                < 0
+        });
+        if min_is_negative {
             return CompressionEstimate::Verdict(EstimateVerdict::Skip);
         }
 
