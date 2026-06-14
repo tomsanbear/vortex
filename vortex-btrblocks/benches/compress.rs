@@ -5,6 +5,7 @@
 
 #[cfg(not(codspeed))]
 mod benchmarks {
+    use std::sync::Arc;
     use std::sync::LazyLock;
 
     use divan::Bencher;
@@ -17,9 +18,16 @@ mod benchmarks {
     use vortex_array::IntoArray;
     use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::arrays::VarBinViewArray;
+    use vortex_array::dtype::DType;
+    use vortex_array::dtype::Nullability;
     use vortex_array::session::ArraySession;
     use vortex_btrblocks::BtrBlocksCompressor;
+    use vortex_btrblocks::BtrBlocksCompressorBuilder;
+    use vortex_btrblocks::schemes::string::FSSTScheme;
+    use vortex_btrblocks::schemes::string::FSSTSchemeWithPretrained;
     use vortex_buffer::buffer_mut;
+    use vortex_fsst::fsst_train_compressor;
     use vortex_session::VortexSession;
     use vortex_utils::aliases::hash_set::HashSet;
 
@@ -60,6 +68,69 @@ mod benchmarks {
                 compressor
                     .compress(&array.clone().into_array(), ctx)
                     .unwrap()
+            });
+    }
+
+    const FSST_FRAGMENT_COUNT: usize = 100;
+    const FSST_FRAGMENT_SIZE: usize = 256;
+
+    fn make_string_fragments() -> Vec<ArrayRef> {
+        (0..FSST_FRAGMENT_COUNT)
+            .map(|batch| {
+                let strings: Vec<String> = (0..FSST_FRAGMENT_SIZE)
+                    .map(|row| {
+                        format!(
+                            "https://api.example.com/v2/orders/{:08x}/status",
+                            batch * FSST_FRAGMENT_SIZE + row
+                        )
+                    })
+                    .collect();
+                VarBinViewArray::from_iter(
+                    strings.iter().map(|s| Some(s.as_str())),
+                    DType::Utf8(Nullability::NonNullable),
+                )
+                .into_array()
+            })
+            .collect()
+    }
+
+    #[divan::bench]
+    fn fsst_default(bencher: Bencher) {
+        let fragments = make_string_fragments();
+        let compressor = BtrBlocksCompressorBuilder::empty()
+            .with_new_scheme(&FSSTScheme)
+            .build();
+        let total_rows = fragments.len() * FSST_FRAGMENT_SIZE;
+        bencher
+            .with_inputs(|| (&fragments, SESSION.create_execution_ctx()))
+            .counter(ItemsCount::new(total_rows))
+            .bench_refs(|(fragments, ctx)| {
+                for fragment in fragments.iter() {
+                    compressor.compress(fragment, ctx).unwrap();
+                }
+            });
+    }
+
+    #[divan::bench]
+    fn fsst_pretrained(bencher: Bencher) {
+        let fragments = make_string_fragments();
+        let pretrained = Arc::new(fsst_train_compressor(
+            &fragments[0]
+                .clone()
+                .execute::<VarBinViewArray>(&mut SESSION.create_execution_ctx())
+                .unwrap(),
+        ));
+        let compressor = BtrBlocksCompressorBuilder::empty()
+            .with_new_scheme_arc(Arc::new(FSSTSchemeWithPretrained::new(pretrained)))
+            .build();
+        let total_rows = fragments.len() * FSST_FRAGMENT_SIZE;
+        bencher
+            .with_inputs(|| (&fragments, SESSION.create_execution_ctx()))
+            .counter(ItemsCount::new(total_rows))
+            .bench_refs(|(fragments, ctx)| {
+                for fragment in fragments.iter() {
+                    compressor.compress(fragment, ctx).unwrap();
+                }
             });
     }
 }

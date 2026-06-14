@@ -13,6 +13,7 @@ use vortex_array::arrays::primitive::PrimitiveArrayExt;
 use vortex_array::arrays::varbin::VarBinArrayExt;
 use vortex_compressor::estimate::CompressionEstimate;
 use vortex_compressor::estimate::DeferredEstimate;
+use vortex_compressor::scheme::SchemeId;
 use vortex_error::VortexResult;
 use vortex_fsst::FSST;
 use vortex_fsst::FSSTArrayExt;
@@ -66,50 +67,70 @@ impl Scheme for FSSTScheme {
     ) -> VortexResult<ArrayRef> {
         let utf8 = data.array_as_varbinview().into_owned();
         let compressor_fsst = fsst_train_compressor(&utf8);
-        let fsst = fsst_compress(&utf8, utf8.len(), utf8.dtype(), &compressor_fsst, exec_ctx);
-
-        let uncompressed_lengths_primitive = fsst
-            .uncompressed_lengths()
-            .clone()
-            .execute::<PrimitiveArray>(exec_ctx)?
-            .narrow(exec_ctx)?;
-        let compressed_original_lengths = compressor.compress_child(
-            &uncompressed_lengths_primitive.into_array(),
-            &compress_ctx,
+        fsst_compress_with_compressor(
+            &compressor_fsst,
+            compressor,
+            data,
+            compress_ctx,
             self.id(),
-            0,
             exec_ctx,
-        )?;
-
-        let codes_offsets_primitive = fsst
-            .codes()
-            .offsets()
-            .clone()
-            .execute::<PrimitiveArray>(exec_ctx)?
-            .narrow(exec_ctx)?;
-        let compressed_codes_offsets = compressor.compress_child(
-            &codes_offsets_primitive.into_array(),
-            &compress_ctx,
-            self.id(),
-            1,
-            exec_ctx,
-        )?;
-        let compressed_codes = VarBinArray::try_new(
-            compressed_codes_offsets,
-            fsst.codes().bytes().clone(),
-            fsst.codes().dtype().clone(),
-            fsst.codes().validity()?,
-        )?;
-
-        let fsst = FSST::try_new(
-            fsst.dtype().clone(),
-            fsst.symbols().clone(),
-            fsst.symbol_lengths().clone(),
-            compressed_codes,
-            compressed_original_lengths,
-            exec_ctx,
-        )?;
-
-        Ok(fsst.into_array())
+        )
     }
+}
+
+/// Shared FSST compression pipeline.
+pub(super) fn fsst_compress_with_compressor(
+    fsst_compressor: &fsst::Compressor,
+    cascading: &CascadingCompressor,
+    data: &ArrayAndStats,
+    compress_ctx: CompressorContext,
+    scheme_id: SchemeId,
+    exec_ctx: &mut ExecutionCtx,
+) -> VortexResult<ArrayRef> {
+    let utf8 = data.array_as_varbinview().into_owned();
+    let fsst = fsst_compress(&utf8, utf8.len(), utf8.dtype(), fsst_compressor, exec_ctx);
+
+    let uncompressed_lengths_primitive = fsst
+        .uncompressed_lengths()
+        .clone()
+        .execute::<PrimitiveArray>(exec_ctx)?
+        .narrow(exec_ctx)?;
+    let compressed_original_lengths = cascading.compress_child(
+        &uncompressed_lengths_primitive.into_array(),
+        &compress_ctx,
+        scheme_id,
+        0,
+        exec_ctx,
+    )?;
+
+    let codes_offsets_primitive = fsst
+        .codes()
+        .offsets()
+        .clone()
+        .execute::<PrimitiveArray>(exec_ctx)?
+        .narrow(exec_ctx)?;
+    let compressed_codes_offsets = cascading.compress_child(
+        &codes_offsets_primitive.into_array(),
+        &compress_ctx,
+        scheme_id,
+        1,
+        exec_ctx,
+    )?;
+    let compressed_codes = VarBinArray::try_new(
+        compressed_codes_offsets,
+        fsst.codes().bytes().clone(),
+        fsst.codes().dtype().clone(),
+        fsst.codes().validity()?,
+    )?;
+
+    let fsst = FSST::try_new(
+        fsst.dtype().clone(),
+        fsst.symbols().clone(),
+        fsst.symbol_lengths().clone(),
+        compressed_codes,
+        compressed_original_lengths,
+        exec_ctx,
+    )?;
+
+    Ok(fsst.into_array())
 }

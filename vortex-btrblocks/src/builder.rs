@@ -3,6 +3,9 @@
 
 //! Builder for configuring `BtrBlocksCompressor` instances.
 
+use std::sync::Arc;
+
+use vortex_compressor::scheme::arc_from_static_scheme;
 use vortex_utils::aliases::hash_set::HashSet;
 
 use crate::BtrBlocksCompressor;
@@ -95,13 +98,17 @@ pub const ALL_SCHEMES: &[&dyn Scheme] = &[
 /// ```
 #[derive(Debug, Clone)]
 pub struct BtrBlocksCompressorBuilder {
-    schemes: Vec<&'static dyn Scheme>,
+    schemes: Vec<Arc<dyn Scheme>>,
 }
 
 impl Default for BtrBlocksCompressorBuilder {
     fn default() -> Self {
         Self {
-            schemes: ALL_SCHEMES.to_vec(),
+            schemes: ALL_SCHEMES
+                .iter()
+                .copied()
+                .map(arc_from_static_scheme)
+                .collect(),
         }
     }
 }
@@ -116,15 +123,21 @@ impl BtrBlocksCompressorBuilder {
         }
     }
 
-    /// Adds an external compression scheme not in [`ALL_SCHEMES`].
-    ///
-    /// This allows encoding crates outside of `vortex-btrblocks` to register their own schemes
-    /// with the compressor.
+    /// Adds an external static compression scheme not in [`ALL_SCHEMES`].
     ///
     /// # Panics
     ///
     /// Panics if a scheme with the same [`SchemeId`] is already present.
-    pub fn with_new_scheme(mut self, scheme: &'static dyn Scheme) -> Self {
+    pub fn with_new_scheme(self, scheme: &'static dyn Scheme) -> Self {
+        self.with_new_scheme_arc(arc_from_static_scheme(scheme))
+    }
+
+    /// Adds an owned compression scheme that carries runtime state.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a scheme with the same [`SchemeId`] is already present.
+    pub fn with_new_scheme_arc(mut self, scheme: Arc<dyn Scheme>) -> Self {
         assert!(
             !self.schemes.iter().any(|s| s.id() == scheme.id()),
             "scheme {:?} is already present in the builder",
@@ -133,6 +146,13 @@ impl BtrBlocksCompressorBuilder {
 
         self.schemes.push(scheme);
         self
+    }
+
+    /// Replaces an existing scheme with a new owned variant sharing the same
+    /// [`SchemeId`].
+    pub fn replace_scheme_arc(self, scheme: Arc<dyn Scheme>) -> Self {
+        let id = scheme.id();
+        self.exclude_schemes([id]).with_new_scheme_arc(scheme)
     }
 
     /// Adds compact encoding schemes (Zstd for strings and binary, Pco for numerics).
@@ -203,7 +223,7 @@ impl BtrBlocksCompressorBuilder {
 
     /// Builds the configured [`BtrBlocksCompressor`].
     pub fn build(self) -> BtrBlocksCompressor {
-        BtrBlocksCompressor(CascadingCompressor::new(self.schemes))
+        BtrBlocksCompressor(CascadingCompressor::with_owned_schemes(self.schemes))
     }
 }
 

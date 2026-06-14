@@ -4,6 +4,7 @@
 //! Compression ratio estimation types and sampling-based estimation.
 
 use std::fmt;
+use std::sync::Arc;
 
 use vortex_array::ArrayRef;
 use vortex_array::Canonical;
@@ -182,7 +183,7 @@ impl WinnerEstimate {
 /// Returns `true` if `score` beats the current best estimate.
 pub(super) fn is_better_score(
     score: EstimateScore,
-    best: Option<&(&'static dyn Scheme, EstimateScore)>,
+    best: Option<&(Arc<dyn Scheme>, EstimateScore)>,
 ) -> bool {
     score.is_valid() && best.is_none_or(|(_, best_score)| score.beats(*best_score))
 }

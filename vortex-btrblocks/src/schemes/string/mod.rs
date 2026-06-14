@@ -4,6 +4,7 @@
 //! String compression schemes.
 
 mod fsst;
+mod fsst_pretrained;
 mod sparse;
 
 #[cfg(feature = "zstd")]
@@ -15,6 +16,7 @@ mod zstd_buffers;
 mod onpair;
 
 pub use fsst::FSSTScheme;
+pub use fsst_pretrained::FSSTSchemeWithPretrained;
 #[cfg(feature = "unstable_encodings")]
 pub use onpair::OnPairScheme;
 pub use sparse::NullDominatedSparseScheme;
