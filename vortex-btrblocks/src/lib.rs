@@ -67,6 +67,7 @@ pub use canonical_compressor::BtrBlocksCompressor;
 pub use schemes::patches::compress_patches;
 pub use vortex_compressor::CascadingCompressor;
 pub use vortex_compressor::ctx::CompressorContext;
+pub use vortex_compressor::ctx::WinnerObserver;
 pub use vortex_compressor::ctx::MAX_CASCADE;
 pub use vortex_compressor::scheme::Scheme;
 pub use vortex_compressor::scheme::SchemeExt;
