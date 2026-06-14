@@ -58,6 +58,14 @@ pub fn bitpack_encode(
             array.statistics().compute_min::<P>(ctx).unwrap_or_default() < 0
         });
         if has_negative_values {
+            eprintln!(
+                "BITPACK_ENCODE NEGATIVE: ptype={:?} len={} bit_width={}",
+                array.ptype(),
+                array.len(),
+                bit_width,
+            );
+            let bt = std::backtrace::Backtrace::force_capture();
+            eprintln!("Backtrace:\n{}", bt);
             vortex_bail!(InvalidArgument: "cannot bitpack_encode array containing negative integers")
         }
     }
