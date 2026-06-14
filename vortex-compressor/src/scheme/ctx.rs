@@ -112,10 +112,15 @@ impl fmt::Debug for CompressorContext {
 }
 
 impl CompressorContext {
-    /// Creates a new `CompressorContext`.
+    /// Creates a new `CompressorContext` with default state.
     ///
-    /// This should **only** be created by the compressor.
-    pub(crate) fn new() -> Self {
+    /// External callers that want to attach scheme-selection hints
+    /// (e.g. via [`Self::with_frozen_scheme`] or
+    /// [`Self::with_winner_observer`]) before handing the context to
+    /// [`CascadingCompressor::compress_with_ctx`](crate::CascadingCompressor::compress_with_ctx)
+    /// start from this constructor.
+    #[must_use]
+    pub fn new() -> Self {
         Self {
             is_sample: false,
             allowed_cascading: MAX_CASCADE,

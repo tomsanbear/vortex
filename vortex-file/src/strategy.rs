@@ -59,6 +59,7 @@ pub struct WriteStrategyBuilder {
     row_block_size: usize,
     data_block_target_bytes: Option<u64>,
     field_writers: HashMap<FieldPath, Arc<dyn LayoutStrategy>>,
+    field_compressors: HashMap<FieldPath, Arc<dyn CompressorPlugin>>,
     allow_encodings: Option<HashSet<ArrayId>>,
     flat_strategy: Option<Arc<dyn LayoutStrategy>>,
     probe_compressor: Option<Arc<dyn CompressorPlugin>>,
@@ -77,6 +78,7 @@ impl Default for WriteStrategyBuilder {
             row_block_size: 8192,
             data_block_target_bytes: Some(ONE_MEG),
             field_writers: HashMap::new(),
+            field_compressors: HashMap::new(),
             allow_encodings: None,
             flat_strategy: None,
             probe_compressor: None,
@@ -173,6 +175,28 @@ impl WriteStrategyBuilder {
         self
     }
 
+    /// Register per-leaf-field [`CompressorPlugin`] overrides.
+    ///
+    /// Each entry instructs [`Self::build`] to construct a per-field
+    /// `LayoutStrategy` chain that mirrors the default fallback shape
+    /// (repartition → zoned-stats → dict-or-fallback → coalescing →
+    /// compressing → buffered → chunked → flat) but swaps the leaf
+    /// [`CompressingStrategy`]'s `CompressorPlugin` for the registered
+    /// override. The resulting strategies are inserted into
+    /// `field_writers`; an explicit [`Self::with_field_writer`] entry
+    /// for the same `FieldPath` takes precedence.
+    ///
+    /// Useful for callers that want per-column compressor state (e.g.
+    /// a per-column scheme-selection-winner cache) without
+    /// reconstructing the rest of the strategy chain.
+    pub fn with_field_compressors<I>(mut self, compressors: I) -> Self
+    where
+        I: IntoIterator<Item = (FieldPath, Arc<dyn CompressorPlugin>)>,
+    {
+        self.field_compressors = compressors.into_iter().collect();
+        self
+    }
+
     /// Builds the canonical [`LayoutStrategy`] implementation, with the configured overrides
     /// applied.
     pub fn build(self) -> Arc<dyn LayoutStrategy> {
@@ -201,16 +225,11 @@ impl WriteStrategyBuilder {
             flat
         };
 
-        // 7. for each chunk create a flat layout
-        let chunked = ChunkedLayoutStrategy::new(Arc::clone(&flat));
-        // 6. buffer chunks so they end up with closer segment ids physically
-        let buffered = BufferedStrategy::new(chunked, 2 * ONE_MEG); // 2MB
-
         // 5. compress each chunk.
         // Exclude IntDictScheme from the data compressor because DictStrategy (step 3) already
         // dictionary-encodes columns. Allowing IntDictScheme here would redundantly
         // dictionary-encode the integer codes produced by that earlier step.
-        let data_compressor: Arc<dyn CompressorPlugin> = match &compressor {
+        let default_data_compressor: Arc<dyn CompressorPlugin> = match &compressor {
             CompressorConfig::BtrBlocks(builder) => Arc::new(
                 builder
                     .clone()
@@ -219,78 +238,106 @@ impl WriteStrategyBuilder {
             ),
             CompressorConfig::Opaque(compressor) => Arc::clone(compressor),
         };
-        let compressing = CompressingStrategy::new(buffered, data_compressor);
-
-        // 4. prior to compression, coalesce up to a minimum size
-        let coalescing = RepartitionStrategy::new(
-            compressing,
-            RepartitionWriterOptions {
-                // Write stream partitions roughly become segments. Because Vortex never reads less
-                // than one segment, the size of segments and, therefore, partitions, must be small
-                // enough to both (1) allow fine-grained random access reads and (2) allow
-                // sufficient read concurrency for the desired throughput. One megabyte is small
-                // enough to achieve this for S3 (Durner et al., "Exploiting Cloud Object Storage for
-                // High-Performance Analytics", VLDB Vol 16, Iss 11).
-                block_size_minimum: self.data_block_target_bytes.unwrap_or(0),
-                block_len_multiple: self.row_block_size,
-                block_size_target: self.data_block_target_bytes,
-                canonicalize: true,
-            },
-        );
 
         // 2.1. | 3.1. compress stats tables and dict values.
         let stats_compressor: Arc<dyn CompressorPlugin> = match compressor {
             CompressorConfig::BtrBlocks(builder) => Arc::new(builder.build()),
             CompressorConfig::Opaque(compressor) => compressor,
         };
-        let compress_then_flat = CompressingStrategy::new(flat, Arc::clone(&stats_compressor));
+        let compress_then_flat =
+            CompressingStrategy::new(Arc::clone(&flat), Arc::clone(&stats_compressor));
 
-        // 3. apply dict encoding or fallback
+        // 3. (probe) the compressor DictStrategy uses to decide dict-eligibility.
         let probe_compressor = if let Some(probe_compressor) = self.probe_compressor {
             probe_compressor
         } else {
             Arc::clone(&stats_compressor)
         };
-        let dict = DictStrategy::new(
-            coalescing.clone(),
-            compress_then_flat.clone(),
-            coalescing,
-            Default::default(),
-            probe_compressor,
-        );
 
         let row_block_size = NonZeroUsize::new(self.row_block_size).vortex_expect("must be non 0");
 
-        // 2. calculate stats for each row group
-        let stats = ZonedStrategy::new(
-            dict,
-            compress_then_flat.clone(),
-            ZonedLayoutOptions {
-                block_size: row_block_size,
-                ..Default::default()
-            },
-        );
+        // Build the leaf-field strategy chain (steps 1–7 from the original
+        // composition) parameterised on which `CompressorPlugin` to plug
+        // into the leaf `CompressingStrategy`. The chain is identical
+        // shape for every field; only the data compressor varies.
+        let build_field_chain = |data_compressor: Arc<dyn CompressorPlugin>| -> Arc<dyn LayoutStrategy> {
+            // 7. for each chunk create a flat layout
+            let chunked = ChunkedLayoutStrategy::new(Arc::clone(&flat));
+            // 6. buffer chunks so they end up with closer segment ids physically
+            let buffered = BufferedStrategy::new(chunked, 2 * ONE_MEG); // 2MB
 
-        // 1. repartition each column to fixed row counts
-        let repartition = RepartitionStrategy::new(
-            stats,
-            RepartitionWriterOptions {
-                // No minimum block size in bytes
-                block_size_minimum: 0,
-                // Always repartition into 8K row blocks
-                block_len_multiple: self.row_block_size,
-                block_size_target: None,
-                canonicalize: false,
-            },
-        );
+            let compressing = CompressingStrategy::new(buffered, data_compressor);
+
+            // 4. prior to compression, coalesce up to a minimum size
+            let coalescing = RepartitionStrategy::new(
+                compressing,
+                RepartitionWriterOptions {
+                    // Write stream partitions roughly become segments. Because Vortex never reads
+                    // less than one segment, the size of segments and, therefore, partitions, must
+                    // be small enough to both (1) allow fine-grained random access reads and (2)
+                    // allow sufficient read concurrency for the desired throughput. One megabyte is
+                    // small enough to achieve this for S3 (Durner et al., "Exploiting Cloud Object
+                    // Storage for High-Performance Analytics", VLDB Vol 16, Iss 11).
+                    block_size_minimum: self.data_block_target_bytes.unwrap_or(0),
+                    block_len_multiple: self.row_block_size,
+                    block_size_target: self.data_block_target_bytes,
+                    canonicalize: true,
+                },
+            );
+
+            // 3. apply dict encoding or fallback
+            let dict = DictStrategy::new(
+                coalescing.clone(),
+                compress_then_flat.clone(),
+                coalescing,
+                Default::default(),
+                Arc::clone(&probe_compressor),
+            );
+
+            // 2. calculate stats for each row group
+            let stats = ZonedStrategy::new(
+                dict,
+                compress_then_flat.clone(),
+                ZonedLayoutOptions {
+                    block_size: row_block_size,
+                    ..Default::default()
+                },
+            );
+
+            // 1. repartition each column to fixed row counts
+            let repartition = RepartitionStrategy::new(
+                stats,
+                RepartitionWriterOptions {
+                    // No minimum block size in bytes
+                    block_size_minimum: 0,
+                    // Always repartition into 8K row blocks
+                    block_len_multiple: self.row_block_size,
+                    block_size_target: None,
+                    canonicalize: false,
+                },
+            );
+            Arc::new(repartition)
+        };
+
+        // Convert per-field compressor overrides into per-field
+        // `LayoutStrategy` entries with the shared chain shape, then
+        // merge them into any explicit `with_field_writer` overrides
+        // (explicit `with_field_writer` takes precedence).
+        let mut field_writers = self.field_writers;
+        for (path, compressor) in self.field_compressors {
+            field_writers
+                .entry(path)
+                .or_insert_with(|| build_field_chain(compressor));
+        }
+
+        let fallback = build_field_chain(default_data_compressor);
 
         // 0. start with splitting columns
         let validity_strategy = CollectStrategy::new(compress_then_flat.clone());
 
         // Take any field overrides from the builder and apply them to the final strategy.
-        let mut table_strategy =
-            TableStrategy::new(Arc::new(validity_strategy), Arc::new(repartition))
-                .with_field_writers(self.field_writers);
+        let mut table_strategy = TableStrategy::new(Arc::new(validity_strategy), fallback)
+            .with_field_writers(field_writers);
 
         if self.use_list_layout {
             // We need a closure here to enable recursive application of list layout.
