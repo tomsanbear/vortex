@@ -150,13 +150,35 @@ impl CascadingCompressor {
         array: &ArrayRef,
         exec_ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
+        self.compress_with_ctx(array, CompressorContext::new(), exec_ctx)
+    }
+
+    /// Compresses an array using a caller-supplied [`CompressorContext`].
+    ///
+    /// [`Self::compress`] starts the cascade with a fresh default
+    /// context, which leaves no room for the caller to pre-set
+    /// scheme-selection hints. This variant takes the context as input
+    /// so a caller that knows the winning scheme upfront (e.g. via a
+    /// per-column cache populated from a prior fragment) can attach the
+    /// hint with [`CompressorContext::with_frozen_scheme`] and skip the
+    /// cascade's selection + stats-merge work.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if canonicalization or compression fails.
+    pub fn compress_with_ctx(
+        &self,
+        array: &ArrayRef,
+        compress_ctx: CompressorContext,
+        exec_ctx: &mut ExecutionCtx,
+    ) -> VortexResult<ArrayRef> {
         let before_nbytes = array.nbytes();
         let span = trace::compress_span(array.len(), array.dtype(), before_nbytes);
         let _enter = span.enter();
 
         let canonical = array.clone().execute::<CanonicalValidity>(exec_ctx)?.0;
         let compact = canonical.compact(exec_ctx)?;
-        let compressed = self.compress_canonical(compact, CompressorContext::new(), exec_ctx)?;
+        let compressed = self.compress_canonical(compact, compress_ctx, exec_ctx)?;
 
         trace::record_compress_outcome(&span, before_nbytes, compressed.nbytes());
 
@@ -316,6 +338,71 @@ impl CascadingCompressor {
         compress_ctx: CompressorContext,
         exec_ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
+        // Caller-supplied scheme winner fast path: when
+        // [`CompressorContext::frozen_scheme`] is set and a registered
+        // scheme matches that id, this scheme's compress runs without
+        // the eligible-schemes filter, without the merged stats-options
+        // fold (so any per-scheme stats that selection would have
+        // computed only to discard are skipped — notably the integer
+        // dict-distinct counters that the cascade computes whenever an
+        // IntDict candidate is in scope), and without the two-pass
+        // `choose_best_scheme` dispatch. Stats are generated from the
+        // chosen scheme's own [`Scheme::stats_options`] only.
+        //
+        // On miss (id not registered, scheme refuses the canonical type
+        // via its [`matches`] check, or the cascade's exclusion rules
+        // would otherwise skip it) the path falls through to normal
+        // selection. A stale or wrong hint never produces an incorrect
+        // compressed output; the worst case is one wasted lookup.
+        if let Some(frozen_id) = compress_ctx.frozen_scheme() {
+            if let Some(frozen) = self
+                .schemes
+                .iter()
+                .find(|s| {
+                    s.id() == frozen_id
+                        && s.matches(&canonical)
+                        && !self.is_excluded(s.as_ref(), &compress_ctx)
+                })
+                .cloned()
+            {
+                let array: ArrayRef = canonical.into();
+                if array.is_empty() {
+                    return Ok(array);
+                }
+                if array.all_invalid(exec_ctx)? {
+                    return Ok(ConstantArray::new(
+                        Scalar::null(array.dtype().clone()),
+                        array.len(),
+                    )
+                    .into_array());
+                }
+                let before_nbytes = array.nbytes();
+                let opts = frozen.stats_options();
+                let compress_ctx = compress_ctx.with_merged_stats_options(opts);
+                let data = ArrayAndStats::new(array, opts);
+                let error_ctx = trace::enabled_error_context(&compress_ctx);
+                let _winner_span = trace::winner_compress_span(frozen.id(), before_nbytes).entered();
+                let compressed = frozen
+                    .compress(self, &data, compress_ctx, exec_ctx)
+                    .inspect_err(|err| {
+                        trace::scheme_compress_failed(
+                            frozen.id(),
+                            before_nbytes,
+                            error_ctx.as_ref(),
+                            err,
+                        );
+                    })?;
+                let after_nbytes = compressed.nbytes();
+                let accepted = after_nbytes < before_nbytes || compressed.is::<AnyScalarFn>();
+                trace::record_winner_compress_result(after_nbytes, None, None, accepted);
+                return Ok(if accepted {
+                    compressed
+                } else {
+                    data.into_array()
+                });
+            }
+        }
+
         let eligible_schemes: Vec<Arc<dyn Scheme>> = self
             .schemes
             .iter()
@@ -1338,6 +1425,131 @@ mod tests {
             Some((scheme, WinnerEstimate::Score(EstimateScore::FiniteCompression(r))))
                 if scheme.id() == DirectRatioScheme.id() && r == 2.0
         ));
+        Ok(())
+    }
+
+    /// `CompressorContext::with_frozen_scheme` sets a winner upfront; when
+    /// the chosen id is registered and applicable, the cascade dispatches
+    /// directly to it. We assert by registering TWO schemes: a
+    /// `DirectRatioScheme` (would lose) and a `RecordingScheme` we point
+    /// at — the recording scheme's `compress` runs and produces a known
+    /// sentinel, so we can tell the freeze path fired without coupling to
+    /// scheme-selection ordering.
+    #[test]
+    fn frozen_scheme_runs_directly_when_registered() -> VortexResult<()> {
+        #[derive(Debug, Clone)]
+        struct RecordingScheme {
+            invoked: Arc<Mutex<bool>>,
+        }
+        impl Scheme for RecordingScheme {
+            fn scheme_name(&self) -> &'static str {
+                "test.recording"
+            }
+            fn matches(&self, canonical: &Canonical) -> bool {
+                matches_integer_primitive(canonical)
+            }
+            fn expected_compression_ratio(
+                &self,
+                _data: &ArrayAndStats,
+                _compress_ctx: CompressorContext,
+                _exec_ctx: &mut ExecutionCtx,
+            ) -> CompressionEstimate {
+                // Lower ratio than `DirectRatioScheme`'s 2.0 — would lose
+                // a normal selection. The freeze path must pick this anyway.
+                CompressionEstimate::Verdict(EstimateVerdict::Ratio(1.1))
+            }
+            fn compress(
+                &self,
+                _compressor: &CascadingCompressor,
+                data: &ArrayAndStats,
+                _compress_ctx: CompressorContext,
+                _exec_ctx: &mut ExecutionCtx,
+            ) -> VortexResult<ArrayRef> {
+                *self.invoked.lock() = true;
+                Ok(NullArray::new(data.array().len()).into_array())
+            }
+        }
+
+        let invoked = Arc::new(Mutex::new(false));
+        let recording = Arc::new(RecordingScheme {
+            invoked: Arc::clone(&invoked),
+        });
+        let recording_id = recording.id();
+        let schemes: Vec<Arc<dyn Scheme>> = vec![
+            Arc::new(DirectRatioScheme),
+            Arc::clone(&recording) as Arc<dyn Scheme>,
+        ];
+        let compressor = CascadingCompressor::with_owned_schemes(schemes);
+
+        let array =
+            PrimitiveArray::new(buffer![1i32, 2, 3, 4], Validity::NonNullable).into_array();
+        let ctx = CompressorContext::new().with_frozen_scheme(recording_id);
+        let mut exec_ctx = SESSION.create_execution_ctx();
+        drop(compressor.compress_with_ctx(&array, ctx, &mut exec_ctx)?);
+        assert!(
+            *invoked.lock(),
+            "frozen scheme's compress must run when its id is registered"
+        );
+        Ok(())
+    }
+
+    /// A frozen scheme id that is not registered must fall through to
+    /// normal selection. Otherwise stale or wrong hints would break
+    /// compression. Constructed compressor has only `RecordingScheme`
+    /// (the winner of a normal selection); the frozen hint points at an
+    /// unregistered scheme and must not prevent `RecordingScheme` from
+    /// winning.
+    #[test]
+    fn frozen_scheme_falls_through_when_unregistered() -> VortexResult<()> {
+        #[derive(Debug, Clone)]
+        struct RecordingScheme {
+            invoked: Arc<Mutex<bool>>,
+        }
+        impl Scheme for RecordingScheme {
+            fn scheme_name(&self) -> &'static str {
+                "test.recording.fallthrough"
+            }
+            fn matches(&self, canonical: &Canonical) -> bool {
+                matches_integer_primitive(canonical)
+            }
+            fn expected_compression_ratio(
+                &self,
+                _data: &ArrayAndStats,
+                _compress_ctx: CompressorContext,
+                _exec_ctx: &mut ExecutionCtx,
+            ) -> CompressionEstimate {
+                CompressionEstimate::Verdict(EstimateVerdict::Ratio(2.0))
+            }
+            fn compress(
+                &self,
+                _compressor: &CascadingCompressor,
+                data: &ArrayAndStats,
+                _compress_ctx: CompressorContext,
+                _exec_ctx: &mut ExecutionCtx,
+            ) -> VortexResult<ArrayRef> {
+                *self.invoked.lock() = true;
+                Ok(NullArray::new(data.array().len()).into_array())
+            }
+        }
+
+        let invoked = Arc::new(Mutex::new(false));
+        let recording = Arc::new(RecordingScheme {
+            invoked: Arc::clone(&invoked),
+        });
+        let schemes: Vec<Arc<dyn Scheme>> = vec![Arc::clone(&recording) as Arc<dyn Scheme>];
+        let compressor = CascadingCompressor::with_owned_schemes(schemes);
+
+        // Point the hint at `IntDictScheme.id()`, which is NOT registered
+        // on this compressor instance.
+        let array =
+            PrimitiveArray::new(buffer![1i32, 2, 3, 4], Validity::NonNullable).into_array();
+        let ctx = CompressorContext::new().with_frozen_scheme(IntDictScheme.id());
+        let mut exec_ctx = SESSION.create_execution_ctx();
+        drop(compressor.compress_with_ctx(&array, ctx, &mut exec_ctx)?);
+        assert!(
+            *invoked.lock(),
+            "unregistered hint must fall through to normal selection"
+        );
         Ok(())
     }
 
