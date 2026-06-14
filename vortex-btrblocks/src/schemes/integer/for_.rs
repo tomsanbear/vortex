@@ -88,6 +88,26 @@ impl Scheme for FoRScheme {
             None => return CompressionEstimate::Verdict(EstimateVerdict::Skip),
         };
 
+        // For signed integer inputs whose (max - min) span exceeds the
+        // signed type's positive range, `FoR.encode`'s `wrapping_sub`
+        // produces biased values that read as negative when interpreted
+        // as the original signed type. The unconditional
+        // `BitPackingScheme.compress` call inside `Self::compress`
+        // (immediately below) then trips `bitpack_encode`'s
+        // negative-integer guard. Skip FoR for these inputs — the
+        // compression ratio would have been 1.0 in this regime anyway
+        // (`for_bitwidth == full_width`), so refusing here costs no
+        // realistic compression while keeping the bitpack precondition
+        // intact for the cascade's other consumers.
+        let signed_full_width = data
+            .array_as_primitive()
+            .ptype()
+            .bit_width()
+            .saturating_sub(1) as u32;
+        if data.array_as_primitive().ptype().is_signed_int() && for_bitwidth > signed_full_width {
+            return CompressionEstimate::Verdict(EstimateVerdict::Skip);
+        }
+
         // If BitPacking can be applied (only non-negative values) and FoR doesn't reduce bit width
         // compared to BitPacking, don't use FoR since it has a small amount of overhead (storing
         // the reference) for effectively no benefits.
