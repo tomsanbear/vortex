@@ -343,6 +343,9 @@ impl CascadingCompressor {
                 }
                 let before_nbytes = array.nbytes();
                 let opts = frozen.stats_options();
+                if let Some(observer) = compress_ctx.winner_observer() {
+                    observer(frozen.id());
+                }
                 let compress_ctx = compress_ctx.with_merged_stats_options(opts);
                 let data = ArrayAndStats::new(array, opts);
                 let error_ctx = trace::enabled_error_context(&compress_ctx);
@@ -403,6 +406,10 @@ impl CascadingCompressor {
         else {
             return Ok(data.into_array());
         };
+
+        if let Some(observer) = compress_ctx.winner_observer() {
+            observer(winner.id());
+        }
 
         // Run the winning scheme's `compress`. On failure, emit an ERROR event carrying the
         // scheme name and cascade history before propagating.
@@ -1477,6 +1484,73 @@ mod tests {
         assert!(
             *invoked.lock(),
             "unregistered hint must fall through to normal selection"
+        );
+        Ok(())
+    }
+
+    /// `CompressorContext::with_winner_observer` fires the supplied
+    /// callback with the winning scheme's `SchemeId` after selection
+    /// (or after the frozen-scheme fast path picks one) and before the
+    /// scheme's `compress` runs. The callback receives the winner even
+    /// if `compress` later fails — observation is decoupled from
+    /// success.
+    #[test]
+    fn winner_observer_fires_with_chosen_scheme_id() -> VortexResult<()> {
+        let recorded: Arc<Mutex<Option<SchemeId>>> = Arc::new(Mutex::new(None));
+        let observer = {
+            let recorded = Arc::clone(&recorded);
+            Arc::new(move |id: SchemeId| {
+                *recorded.lock() = Some(id);
+            }) as crate::ctx::WinnerObserver
+        };
+        let compressor =
+            CascadingCompressor::new(vec![&IntDictScheme, &FloatDictScheme, &StringDictScheme]);
+        let array = PrimitiveArray::new(
+            buffer![1i32, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+            Validity::NonNullable,
+        )
+        .into_array();
+        let ctx = CompressorContext::new().with_winner_observer(observer);
+        let mut exec_ctx = SESSION.create_execution_ctx();
+        drop(compressor.compress_with_ctx(&array, ctx, &mut exec_ctx)?);
+        let got = *recorded.lock();
+        assert_eq!(
+            got,
+            Some(IntDictScheme.id()),
+            "the observer must receive the winner the cascade picked"
+        );
+        Ok(())
+    }
+
+    /// The observer is dropped on cascade descent so it fires only at
+    /// the level the caller installed it. We exercise this indirectly
+    /// by checking the observer fires exactly once for a top-level
+    /// integer column (whose winner has children — `DictArray` has
+    /// `codes` and `values` — that would fire their own observer if
+    /// the hint were inherited).
+    #[test]
+    fn winner_observer_fires_only_at_root_level() -> VortexResult<()> {
+        let call_count = Arc::new(Mutex::new(0usize));
+        let observer = {
+            let call_count = Arc::clone(&call_count);
+            Arc::new(move |_id: SchemeId| {
+                *call_count.lock() += 1;
+            }) as crate::ctx::WinnerObserver
+        };
+        let compressor =
+            CascadingCompressor::new(vec![&IntDictScheme, &FloatDictScheme, &StringDictScheme]);
+        let array = PrimitiveArray::new(
+            buffer![1i32, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+            Validity::NonNullable,
+        )
+        .into_array();
+        let ctx = CompressorContext::new().with_winner_observer(observer);
+        let mut exec_ctx = SESSION.create_execution_ctx();
+        drop(compressor.compress_with_ctx(&array, ctx, &mut exec_ctx)?);
+        assert_eq!(
+            *call_count.lock(),
+            1,
+            "observer must fire exactly once at the root cascade level"
         );
         Ok(())
     }
