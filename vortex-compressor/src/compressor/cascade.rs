@@ -53,13 +53,34 @@ impl CascadingCompressor {
         array: &ArrayRef,
         exec_ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
+        self.compress_with_ctx(array, CompressorContext::new(), exec_ctx)
+    }
+
+    /// Compresses an array using a caller-supplied [`CompressorContext`].
+    ///
+    /// [`Self::compress`] starts the cascade with a fresh default context, which leaves no room
+    /// for the caller to pre-set scheme-selection hints. This variant takes the context as input
+    /// so a caller that knows the winning scheme upfront (e.g. via a per-column cache populated
+    /// from a prior fragment) can attach the hint with
+    /// [`CompressorContext::with_frozen_scheme`] and skip the cascade's selection + stats-merge
+    /// work.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if canonicalization or compression fails.
+    pub fn compress_with_ctx(
+        &self,
+        array: &ArrayRef,
+        compress_ctx: CompressorContext,
+        exec_ctx: &mut ExecutionCtx,
+    ) -> VortexResult<ArrayRef> {
         let before_nbytes = array.nbytes();
         let span = trace::compress_span(array.len(), array.dtype(), before_nbytes);
         let _enter = span.enter();
 
         let canonical = array.clone().execute::<CanonicalValidity>(exec_ctx)?.0;
         let compact = canonical.compact(exec_ctx)?;
-        let compressed = self.compress_canonical(compact, CompressorContext::new(), exec_ctx)?;
+        let compressed = self.compress_canonical(compact, compress_ctx, exec_ctx)?;
 
         trace::record_compress_outcome(&span, before_nbytes, compressed.nbytes());
 
@@ -240,6 +261,62 @@ impl CascadingCompressor {
         compress_ctx: CompressorContext,
         exec_ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
+        // Caller-supplied scheme winner fast path: when
+        // [`CompressorContext::frozen_scheme`] is set and a registered scheme matches that id,
+        // this scheme's compress runs without the eligible-schemes filter, without the merged
+        // stats-options fold (so any per-scheme stats that selection would have computed only to
+        // discard are skipped — notably the integer dict-distinct counters that the cascade
+        // computes whenever an IntDict candidate is in scope), and without the two-pass
+        // `choose_best_scheme` dispatch. Stats are generated from the chosen scheme's own
+        // [`Scheme::stats_options`] only.
+        //
+        // On miss (id not registered, scheme refuses the canonical type via its
+        // [`matches`](Scheme::matches) check, or the cascade's exclusion rules would otherwise
+        // skip it) the path falls through to normal selection. A stale or wrong hint never
+        // produces an incorrect compressed output; the worst case is one wasted lookup.
+        if let Some(frozen_id) = compress_ctx.frozen_scheme()
+            && let Some(frozen) = self.schemes.iter().copied().find(|s| {
+                s.id() == frozen_id && s.matches(&canonical) && !self.is_excluded(*s, &compress_ctx)
+            })
+        {
+            let array: ArrayRef = canonical.into();
+            if array.is_empty() {
+                return Ok(array);
+            }
+            if array.all_invalid(exec_ctx)? {
+                return Ok(
+                    ConstantArray::new(Scalar::null(array.dtype().clone()), array.len())
+                        .into_array(),
+                );
+            }
+            let before_nbytes = array.nbytes();
+            let opts = frozen.stats_options();
+            let compress_ctx = compress_ctx.with_merged_stats_options(opts);
+            let data = ArrayAndStats::new(array, opts);
+            let error_ctx = trace::enabled_error_context(&compress_ctx);
+            let _winner_span = trace::winner_compress_span(frozen.id(), before_nbytes).entered();
+            let compressed = frozen
+                .compress(self, &data, compress_ctx, exec_ctx)
+                .inspect_err(|err| {
+                    trace::scheme_compress_failed(
+                        frozen.id(),
+                        before_nbytes,
+                        error_ctx.as_ref(),
+                        err,
+                    );
+                })?;
+            let after_nbytes = compressed.nbytes();
+            let actual_ratio =
+                (after_nbytes != 0).then(|| before_nbytes as f64 / after_nbytes as f64);
+            let accepted = after_nbytes < before_nbytes;
+            trace::record_winner_compress_result(after_nbytes, None, actual_ratio, accepted);
+            return Ok(if accepted {
+                compressed
+            } else {
+                data.into_array()
+            });
+        }
+
         let eligible_schemes: Vec<&'static dyn Scheme> = self
             .schemes
             .iter()

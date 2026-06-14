@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::sync::Arc;
 use std::sync::LazyLock;
 
 use parking_lot::Mutex;
@@ -839,5 +840,128 @@ fn map_compression_preserves_repeated_entry_children() -> VortexResult<()> {
     assert!(compressed.is::<Map>());
     assert_eq!(compressed.dtype(), array.dtype());
     assert_arrays_eq!(&compressed, &array, &mut exec_ctx);
+    Ok(())
+}
+
+/// `CompressorContext::with_frozen_scheme` sets a winner upfront; when the chosen id is
+/// registered and applicable, the cascade dispatches directly to it. We assert by registering TWO
+/// schemes: a `DirectRatioScheme` (would lose) and a `RecordingScheme` we point at — the
+/// recording scheme's `compress` runs and produces a known sentinel, so we can tell the freeze
+/// path fired without coupling to scheme-selection ordering.
+#[test]
+fn frozen_scheme_runs_directly_when_registered() -> VortexResult<()> {
+    #[derive(Debug, Clone)]
+    struct RecordingScheme {
+        invoked: Arc<Mutex<bool>>,
+    }
+    impl Scheme for RecordingScheme {
+        fn scheme_name(&self) -> &'static str {
+            "test.recording"
+        }
+        fn matches(&self, canonical: &Canonical) -> bool {
+            matches_integer_primitive(canonical)
+        }
+        fn produced_encodings(&self) -> Vec<ArrayId> {
+            Vec::new()
+        }
+        fn expected_compression_ratio(
+            &self,
+            _data: &ArrayAndStats,
+            _compress_ctx: CompressorContext,
+            _exec_ctx: &mut ExecutionCtx,
+        ) -> CompressionEstimate {
+            // Lower ratio than `DirectRatioScheme`'s 2.0 — would lose a normal selection. The
+            // freeze path must pick this anyway.
+            CompressionEstimate::Verdict(EstimateVerdict::Ratio(1.1))
+        }
+        fn compress(
+            &self,
+            _compressor: &CascadingCompressor,
+            data: &ArrayAndStats,
+            _compress_ctx: CompressorContext,
+            _exec_ctx: &mut ExecutionCtx,
+        ) -> VortexResult<ArrayRef> {
+            *self.invoked.lock() = true;
+            Ok(NullArray::new(data.array().len()).into_array())
+        }
+    }
+
+    let invoked = Arc::new(Mutex::new(false));
+    let recording: &'static RecordingScheme = Box::leak(Box::new(RecordingScheme {
+        invoked: Arc::clone(&invoked),
+    }));
+    let recording_id = recording.id();
+    let direct: &'static DirectRatioScheme = Box::leak(Box::new(DirectRatioScheme));
+    let schemes: Vec<&'static dyn Scheme> = vec![direct, recording];
+    let compressor = CascadingCompressor::new(schemes);
+
+    let array = PrimitiveArray::new(buffer![1i32, 2, 3, 4], Validity::NonNullable).into_array();
+    let ctx = CompressorContext::new().with_frozen_scheme(recording_id);
+    let mut exec_ctx = SESSION.create_execution_ctx();
+    drop(compressor.compress_with_ctx(&array, ctx, &mut exec_ctx)?);
+    assert!(
+        *invoked.lock(),
+        "frozen scheme's compress must run when its id is registered"
+    );
+    Ok(())
+}
+
+/// A frozen scheme id that is not registered must fall through to normal selection. Otherwise
+/// stale or wrong hints would break compression. Constructed compressor has only
+/// `RecordingScheme` (the winner of a normal selection); the frozen hint points at an
+/// unregistered scheme and must not prevent `RecordingScheme` from winning.
+#[test]
+fn frozen_scheme_falls_through_when_unregistered() -> VortexResult<()> {
+    #[derive(Debug, Clone)]
+    struct RecordingScheme {
+        invoked: Arc<Mutex<bool>>,
+    }
+    impl Scheme for RecordingScheme {
+        fn scheme_name(&self) -> &'static str {
+            "test.recording.fallthrough"
+        }
+        fn matches(&self, canonical: &Canonical) -> bool {
+            matches_integer_primitive(canonical)
+        }
+        fn produced_encodings(&self) -> Vec<ArrayId> {
+            Vec::new()
+        }
+        fn expected_compression_ratio(
+            &self,
+            _data: &ArrayAndStats,
+            _compress_ctx: CompressorContext,
+            _exec_ctx: &mut ExecutionCtx,
+        ) -> CompressionEstimate {
+            CompressionEstimate::Verdict(EstimateVerdict::Ratio(2.0))
+        }
+        fn compress(
+            &self,
+            _compressor: &CascadingCompressor,
+            data: &ArrayAndStats,
+            _compress_ctx: CompressorContext,
+            _exec_ctx: &mut ExecutionCtx,
+        ) -> VortexResult<ArrayRef> {
+            *self.invoked.lock() = true;
+            Ok(NullArray::new(data.array().len()).into_array())
+        }
+    }
+
+    let invoked = Arc::new(Mutex::new(false));
+    let recording: &'static RecordingScheme = Box::leak(Box::new(RecordingScheme {
+        invoked: Arc::clone(&invoked),
+    }));
+    let schemes: Vec<&'static dyn Scheme> = vec![recording];
+    let compressor = CascadingCompressor::new(schemes);
+
+    // Point the hint at `IntDictScheme.id()`, which is NOT registered on this compressor
+    // instance.
+    let array = PrimitiveArray::new(buffer![1i32, 2, 3, 4], Validity::NonNullable).into_array();
+    let ctx = CompressorContext::new().with_frozen_scheme(IntDictScheme.id());
+    let mut exec_ctx = SESSION.create_execution_ctx();
+    drop(compressor.compress_with_ctx(&array, ctx, &mut exec_ctx)?);
+    assert!(
+        *invoked.lock(),
+        "unregistered hint must fall through to normal selection"
+    );
     Ok(())
 }
