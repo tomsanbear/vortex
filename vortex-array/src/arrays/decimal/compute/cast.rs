@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use num_traits::CheckedDiv;
+use num_traits::CheckedMul;
 use vortex_buffer::Buffer;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
+use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
 
 use crate::ArrayRef;
@@ -16,6 +19,8 @@ use crate::arrays::DecimalArray;
 use crate::dtype::DType;
 use crate::dtype::DecimalType;
 use crate::dtype::NativeDecimalType;
+use crate::dtype::ToI256;
+use crate::dtype::i256;
 use crate::match_each_decimal_value_type;
 use crate::scalar_fn::fns::cast::CastKernel;
 use crate::scalar_fn::fns::cast::CastReduce;
@@ -77,16 +82,31 @@ impl CastKernel for Decimal {
             );
         };
 
-        // Scale changes are not yet supported
-        if from_decimal_dtype.scale() != to_decimal_dtype.scale() {
-            vortex_bail!(
-                "Casting decimal with scale {} to scale {} not yet implemented",
-                from_decimal_dtype.scale(),
-                to_decimal_dtype.scale()
-            );
+        // If the dtype is exactly the same, return self
+        if array.dtype() == dtype {
+            return Ok(Some(array.array().clone()));
         }
 
-        // Downcasting precision is not yet supported
+        // Cast the validity to the new nullability (shared by every path below).
+        let new_validity = array
+            .validity()?
+            .cast_nullability(*to_nullability, array.len(), ctx)?;
+
+        // A scale change rescales every mantissa by 10^(to_scale - from_scale).
+        // DataFusion routinely coerces a decimal comparison to a higher scale
+        // (its float-literal coercion lands on e.g. `decimal(53, 15)`), and the
+        // pruning predicate then casts the column's scale-2 stat up to scale 15
+        // — so a scan that prunes on a decimal column depends on this working.
+        // The result is computed in i256 and stored as i256, a compatible
+        // (wide-enough) physical type for any target precision.
+        if from_decimal_dtype.scale() != to_decimal_dtype.scale() {
+            let rescaled = rescale_decimal_buffer(array, to_decimal_dtype.scale())?;
+            return Ok(Some(
+                DecimalArray::new(rescaled, *to_decimal_dtype, new_validity).into_array(),
+            ));
+        }
+
+        // Same scale: downcasting precision is not yet supported.
         if to_decimal_dtype.precision() < from_decimal_dtype.precision() {
             vortex_bail!(
                 "Downcasting decimal from precision {} to {} not yet implemented",
@@ -95,17 +115,7 @@ impl CastKernel for Decimal {
             );
         }
 
-        // If the dtype is exactly the same, return self
-        if array.dtype() == dtype {
-            return Ok(Some(array.array().clone()));
-        }
-
-        // Cast the validity to the new nullability
-        let new_validity = array
-            .validity()?
-            .cast_nullability(*to_nullability, array.len(), ctx)?;
-
-        // If the target needs a wider physical type, upcast the values
+        // Same scale, wider-or-equal precision: widen the physical type if needed.
         let target_values_type = DecimalType::smallest_decimal_value_type(to_decimal_dtype);
         let array = if target_values_type > array.values_type() {
             upcast_decimal_values(array, target_values_type)?
@@ -126,6 +136,51 @@ impl CastKernel for Decimal {
             ))
         }
     }
+}
+
+/// Rescale every mantissa of `array` from its current scale to `to_scale`, returning the
+/// rescaled values as an `i256` buffer (a compatible physical type for any target precision,
+/// so the caller does not need to pick the narrowest type).
+///
+/// Widening the scale multiplies by `10^delta` and is exact. Narrowing divides by `10^|delta|`
+/// with round-half-away-from-zero, matching Arrow's decimal-cast rounding. A value that no
+/// longer fits `i256`, or a `10^|delta|` factor beyond `i256`, surfaces as an error rather than
+/// silently wrapping.
+fn rescale_decimal_buffer(
+    array: ArrayView<'_, Decimal>,
+    to_scale: i8,
+) -> VortexResult<Buffer<i256>> {
+    let from_scale = array.decimal_dtype().scale();
+    let delta = i32::from(to_scale) - i32::from(from_scale);
+    let magnitude = delta.unsigned_abs();
+    let factor = i256::from_i128(10)
+        .checked_pow(magnitude)
+        .ok_or_else(|| vortex_err!("decimal rescale factor 10^{magnitude} overflows i256"))?;
+    let widening = delta >= 0;
+    let half = factor / i256::from_i128(2);
+
+    match_each_decimal_value_type!(array.values_type(), |F| {
+        array
+            .buffer::<F>()
+            .iter()
+            .map(|&v| {
+                let v = v
+                    .to_i256()
+                    .vortex_expect("a native decimal value always widens to i256");
+                if widening {
+                    v.checked_mul(&factor).ok_or_else(|| {
+                        vortex_err!("decimal value overflows i256 when rescaling to scale {to_scale}")
+                    })
+                } else {
+                    // Round half away from zero before truncating division.
+                    let rounded = if v >= i256::ZERO { v + half } else { v - half };
+                    rounded.checked_div(&factor).ok_or_else(|| {
+                        vortex_err!("decimal rescale division failed narrowing to scale {to_scale}")
+                    })
+                }
+            })
+            .collect::<VortexResult<Buffer<i256>>>()
+    })
 }
 
 /// Upcast a DecimalArray to a wider physical representation (e.g., i32 -> i64) while keeping
@@ -186,8 +241,10 @@ mod tests {
     use vortex_buffer::buffer;
 
     use super::upcast_decimal_values;
+    use crate::ArrayRef;
     use crate::IntoArray;
     use crate::LEGACY_SESSION;
+    use crate::RecursiveCanonical;
     use crate::VortexSessionExecute;
     use crate::arrays::DecimalArray;
     use crate::builtins::ArrayBuiltins;
@@ -198,7 +255,72 @@ mod tests {
     use crate::dtype::DecimalDType;
     use crate::dtype::DecimalType;
     use crate::dtype::Nullability;
+    use crate::dtype::i256;
+    use crate::scalar::DecimalValue;
+    use crate::scalar::Scalar;
     use crate::validity::Validity;
+
+    /// Cast through the execution path (the deprecated lazy `.cast()` alone only
+    /// runs the reduce, which relabels the dtype without rescaling — so a value
+    /// assertion must force the kernel via `execute`).
+    fn cast_and_execute(array: DecimalArray, to: DType) -> ArrayRef {
+        #[expect(deprecated)]
+        array
+            .into_array()
+            .cast(to)
+            .unwrap()
+            .execute::<RecursiveCanonical>(&mut LEGACY_SESSION.create_execution_ctx())
+            .unwrap()
+            .0
+            .into_array()
+    }
+
+    #[test]
+    fn cast_decimal_widens_scale_exactly() {
+        // 123.45, 678.90 at (10, 2) cast to (20, 4): each mantissa multiplies by 100.
+        let array = DecimalArray::new(
+            buffer![12345i32, 67890],
+            DecimalDType::new(10, 2),
+            Validity::NonNullable,
+        );
+        let to_dtype = DecimalDType::new(20, 4);
+        let to = DType::Decimal(to_dtype, Nullability::NonNullable);
+        let casted = cast_and_execute(array, to.clone());
+        assert_eq!(casted.dtype(), &to);
+        let expect = |raw: i128| {
+            Scalar::decimal(
+                DecimalValue::I256(i256::from_i128(raw)),
+                to_dtype,
+                Nullability::NonNullable,
+            )
+        };
+        assert_eq!(casted.scalar_at(0).unwrap(), expect(1_234_500));
+        assert_eq!(casted.scalar_at(1).unwrap(), expect(6_789_000));
+    }
+
+    #[test]
+    fn cast_decimal_narrows_scale_rounds_half_away_from_zero() {
+        // (10, 4) -> (10, 2): divide each mantissa by 100, rounding half away from zero.
+        // 1.2345 -> 1.23 (123.45 -> 123); 1.2355 -> 1.24 (123.55 -> 124); -1.2355 -> -1.24.
+        let array = DecimalArray::new(
+            buffer![12345i32, 12355, -12355],
+            DecimalDType::new(10, 4),
+            Validity::NonNullable,
+        );
+        let to_dtype = DecimalDType::new(10, 2);
+        let to = DType::Decimal(to_dtype, Nullability::NonNullable);
+        let casted = cast_and_execute(array, to);
+        let expect = |raw: i128| {
+            Scalar::decimal(
+                DecimalValue::I256(i256::from_i128(raw)),
+                to_dtype,
+                Nullability::NonNullable,
+            )
+        };
+        assert_eq!(casted.scalar_at(0).unwrap(), expect(123));
+        assert_eq!(casted.scalar_at(1).unwrap(), expect(124));
+        assert_eq!(casted.scalar_at(2).unwrap(), expect(-124));
+    }
 
     #[test]
     fn cast_decimal_to_nullable() {
@@ -262,27 +384,25 @@ mod tests {
     }
 
     #[test]
-    fn cast_different_scale_fails() {
+    fn cast_different_scale_rescales() {
+        // 1.00 at (10, 2) cast to (15, 3): the mantissa multiplies by 10 -> 1000
+        // (= 1.000). Scale changes used to bail; they now rescale.
         let array = DecimalArray::new(
             buffer![100i32],
             DecimalDType::new(10, 2),
             Validity::NonNullable,
         );
-
-        // Try to cast to different scale - not supported
-        let different_dtype = DType::Decimal(DecimalDType::new(15, 3), Nullability::NonNullable);
-        #[expect(deprecated)]
-        let result = array
-            .into_array()
-            .cast(different_dtype)
-            .and_then(|a| a.to_canonical().map(|c| c.into_array()));
-
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Casting decimal with scale 2 to scale 3 not yet implemented")
+        let to_dtype = DecimalDType::new(15, 3);
+        let to = DType::Decimal(to_dtype, Nullability::NonNullable);
+        let casted = cast_and_execute(array, to.clone());
+        assert_eq!(casted.dtype(), &to);
+        assert_eq!(
+            casted.scalar_at(0).unwrap(),
+            Scalar::decimal(
+                DecimalValue::I256(i256::from_i128(1000)),
+                to_dtype,
+                Nullability::NonNullable,
+            ),
         );
     }
 
