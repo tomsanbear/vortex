@@ -60,6 +60,11 @@ impl<'a> DecimalScalar<'a> {
         self.decimal_value
     }
 
+    /// Returns the decimal type (precision and scale) of this scalar.
+    pub fn decimal_dtype(&self) -> DecimalDType {
+        self.decimal_type
+    }
+
     /// Returns whether this decimal value is zero, or `None` if null.
     pub fn is_zero(&self) -> Option<bool> {
         self.decimal_value.map(|v| v.is_zero())

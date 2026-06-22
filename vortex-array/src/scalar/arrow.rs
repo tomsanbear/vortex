@@ -12,6 +12,7 @@ use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
 
 use crate::dtype::DType;
+use crate::dtype::NativeDecimalType;
 use crate::dtype::PType;
 use crate::extension::datetime::AnyTemporal;
 use crate::extension::datetime::TemporalMetadata;
@@ -19,7 +20,6 @@ use crate::extension::datetime::TimeUnit;
 use crate::scalar::BinaryScalar;
 use crate::scalar::BoolScalar;
 use crate::scalar::DecimalScalar;
-use crate::scalar::DecimalValue;
 use crate::scalar::ExtScalar;
 use crate::scalar::PrimitiveScalar;
 use crate::scalar::Scalar;
@@ -94,18 +94,51 @@ fn primitive_to_arrow(scalar: PrimitiveScalar<'_>) -> Result<Arc<dyn Datum>, Vor
 }
 
 /// Convert a [`DecimalScalar`] to an Arrow [`Datum`].
+///
+/// The Arrow array width is chosen by the scalar's declared precision, not its
+/// storage width: Arrow's `Decimal128` tops out at precision 38, so a value in a
+/// `DECIMAL(p > 38, …)` column lands in a `Decimal256` array even when it
+/// physically fits in an `i64`. The precision and scale are carried onto the
+/// array — `Decimal{128,256}Array::new_scalar` stamps Arrow's *default*
+/// precision/scale (`(38, 10)` / `(76, 10)`) instead, which silently re-scales
+/// the value the moment any downstream consumer (stat comparison, pruning, cast
+/// to the target type) reads it back.
 fn decimal_to_arrow(scalar: DecimalScalar<'_>) -> Result<Arc<dyn Datum>, VortexError> {
     // TODO(joe): Replace with decimal32, etc. once Arrow supports them.
+    let decimal_dtype = scalar.decimal_dtype();
+    let precision = decimal_dtype.precision();
+    let scale = decimal_dtype.scale();
+    let use_256 = precision > i128::MAX_PRECISION;
+
     match scalar.decimal_value() {
-        Some(DecimalValue::I8(v)) => Ok(Arc::new(Decimal128Array::new_scalar(v as i128))),
-        Some(DecimalValue::I16(v)) => Ok(Arc::new(Decimal128Array::new_scalar(v as i128))),
-        Some(DecimalValue::I32(v)) => Ok(Arc::new(Decimal128Array::new_scalar(v as i128))),
-        Some(DecimalValue::I64(v)) => Ok(Arc::new(Decimal128Array::new_scalar(v as i128))),
-        Some(DecimalValue::I128(v128)) => Ok(Arc::new(Decimal128Array::new_scalar(v128))),
-        Some(DecimalValue::I256(v256)) => Ok(Arc::new(Decimal256Array::new_scalar(v256.into()))),
-        None => Ok(Arc::new(arrow_array::Scalar::new(
-            Decimal128Array::new_null(SCALAR_ARRAY_LEN),
+        None if use_256 => Ok(Arc::new(ArrowScalar::new(
+            Decimal256Array::new_null(SCALAR_ARRAY_LEN)
+                .with_precision_and_scale(precision, scale)
+                .map_err(|e| vortex_err!("invalid Decimal256 precision/scale: {e}"))?,
         ))),
+        None => Ok(Arc::new(ArrowScalar::new(
+            Decimal128Array::new_null(SCALAR_ARRAY_LEN)
+                .with_precision_and_scale(precision, scale)
+                .map_err(|e| vortex_err!("invalid Decimal128 precision/scale: {e}"))?,
+        ))),
+        Some(value) if use_256 => {
+            let v256: arrow_buffer::i256 = value.as_i256().into();
+            Ok(Arc::new(ArrowScalar::new(
+                Decimal256Array::from_iter_values(std::iter::once(v256))
+                    .with_precision_and_scale(precision, scale)
+                    .map_err(|e| vortex_err!("invalid Decimal256 precision/scale: {e}"))?,
+            )))
+        }
+        Some(value) => {
+            let v128 = value.cast::<i128>().ok_or_else(|| {
+                vortex_err!("decimal value does not fit in i128 for precision {precision}")
+            })?;
+            Ok(Arc::new(ArrowScalar::new(
+                Decimal128Array::from_iter_values(std::iter::once(v128))
+                    .with_precision_and_scale(precision, scale)
+                    .map_err(|e| vortex_err!("invalid Decimal128 precision/scale: {e}"))?,
+            )))
+        }
     }
 }
 
@@ -410,6 +443,51 @@ mod tests {
         let scalar = Scalar::null(DType::Decimal(decimal_dtype, Nullability::Nullable));
         let result = Arc::<dyn Datum>::try_from(&scalar);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_decimal_to_arrow_preserves_precision_and_scale() {
+        use arrow_array::Array;
+        use arrow_array::Decimal128Array;
+        use arrow_array::Decimal256Array;
+
+        // A value in a DECIMAL(20, 4) column must carry (20, 4), not Arrow's
+        // Decimal128 default of (38, 10): `new_scalar` would drop the declared
+        // type and silently re-scale the value for any downstream reader.
+        let d128 = Scalar::decimal(
+            DecimalValue::I128(12345),
+            DecimalDType::new(20, 4),
+            Nullability::NonNullable,
+        );
+        let datum = Arc::<dyn Datum>::try_from(&d128).unwrap();
+        let arr = datum.get().0;
+        let arr = arr.as_any().downcast_ref::<Decimal128Array>().unwrap();
+        assert_eq!((arr.precision(), arr.scale()), (20, 4));
+        assert_eq!(arr.value(0), 12345);
+
+        // Precision > 38 must land in a Decimal256 array carrying the declared
+        // (40, 2) even though the value physically fits a narrower integer.
+        let d256 = Scalar::decimal(
+            DecimalValue::I256(i256::from_i128(67890)),
+            DecimalDType::new(40, 2),
+            Nullability::NonNullable,
+        );
+        let datum = Arc::<dyn Datum>::try_from(&d256).unwrap();
+        let arr = datum.get().0;
+        let arr = arr.as_any().downcast_ref::<Decimal256Array>().unwrap();
+        assert_eq!((arr.precision(), arr.scale()), (40, 2));
+        assert_eq!(arr.value(0), arrow_buffer::i256::from_i128(67890));
+
+        // A null decimal preserves precision/scale and width selection too.
+        let dnull = Scalar::null(DType::Decimal(
+            DecimalDType::new(40, 2),
+            Nullability::Nullable,
+        ));
+        let datum = Arc::<dyn Datum>::try_from(&dnull).unwrap();
+        let arr = datum.get().0;
+        let arr = arr.as_any().downcast_ref::<Decimal256Array>().unwrap();
+        assert_eq!((arr.precision(), arr.scale()), (40, 2));
+        assert!(arr.is_null(0));
     }
 
     #[test]
