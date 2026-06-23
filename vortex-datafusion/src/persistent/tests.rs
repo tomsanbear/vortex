@@ -824,6 +824,51 @@ async fn dynamic_inlist_correct_multi_partition() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Scope guard: a TopK query (`ORDER BY .. LIMIT k`) pushes a dynamic `col < threshold` bound, not
+/// an `InList`. Our InList-only in-scan routing must leave it untouched (it stays a file-level
+/// prune via `FilePruner`), so TopK must still return correct results with the feature active.
+#[tokio::test]
+async fn topk_dynamic_threshold_not_pushed_in_scan() -> anyhow::Result<()> {
+    let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+    let session = VortexSession::default();
+
+    let fact = StructArray::try_new(
+        ["k"].into(),
+        vec![
+            ChunkedArray::from_iter([
+                Buffer::from_iter(0_i32..5_000).into_array(),
+                Buffer::from_iter(5_000_i32..10_000).into_array(),
+            ])
+            .into_array(),
+        ],
+        10_000,
+        Validity::NonNullable,
+    )?;
+    {
+        let mut w = ObjectStoreWrite::new(Arc::clone(&store), &"fact.vortex".into()).await?;
+        session
+            .write_options()
+            .write(&mut w, fact.into_array().to_array_stream())
+            .await?;
+        w.shutdown().await?;
+    }
+
+    // Dynamic filter pushdown on → the TopK threshold reaches the scan's pruning predicate.
+    let ctx = join_ctx(Arc::clone(&store), true);
+    let result = ctx
+        .sql("SELECT k FROM '/fact.vortex' ORDER BY k ASC LIMIT 5")
+        .await?
+        .collect()
+        .await?;
+    assert_eq!(
+        batch_values(&result),
+        vec![0, 1, 2, 3, 4],
+        "TopK must return the 5 smallest keys with the feature active"
+    );
+
+    Ok(())
+}
+
 /// Dynamic-path adapter-rewrite under schema evolution: the probe file stores the join key `k` as
 /// `Int16`, but the table declares it `INT` (`Int32`). The dynamic `InList` (built from `Int32` dim
 /// keys) must be snapshotted and adapter-rewritten to the file's physical type, then still applied
