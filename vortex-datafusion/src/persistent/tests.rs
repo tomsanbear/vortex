@@ -21,6 +21,7 @@ use rstest::rstest;
 use vortex::VortexSessionDefault;
 use vortex::array::IntoArray;
 use vortex::array::arrays::ChunkedArray;
+use vortex::array::arrays::PrimitiveArray;
 use vortex::array::arrays::StructArray;
 use vortex::array::arrays::VarBinArray;
 use vortex::array::validity::Validity;
@@ -958,6 +959,121 @@ async fn measure_dynamic_bounds_prune_only() -> anyhow::Result<()> {
     }
 
     assert_eq!(total_rows, 200, "join should return the 200 matching rows");
+    Ok(())
+}
+
+/// Regression (QuiltDB `level8_joins` SIGABRT): a small-build join keyed on a **nullable** column.
+/// DataFusion builds the `InList` from the nullable build key; the in-scan conversion must mint the
+/// list scalar with matching nullability (and degrade rather than panic if it can't). Nullable is
+/// the common case for QuiltDB join keys, so this must not abort the process.
+#[tokio::test]
+async fn dynamic_inlist_nullable_key_does_not_abort() -> anyhow::Result<()> {
+    let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+    let session = VortexSession::default();
+
+    // All-valid (no nulls) but nullable *dtype* (i32?) — mirrors a QuiltDB column that isn't NOT NULL.
+    let nullable_i32 = |vals: Vec<i32>| {
+        PrimitiveArray::new(Buffer::from_iter(vals), Validity::AllValid).into_array()
+    };
+
+    let fact = StructArray::try_new(
+        ["k", "v"].into(),
+        vec![
+            nullable_i32((0..10_000).collect()),
+            nullable_i32((0..10_000).collect()),
+        ],
+        10_000,
+        Validity::NonNullable,
+    )?;
+    {
+        let mut w = ObjectStoreWrite::new(Arc::clone(&store), &"fact.vortex".into()).await?;
+        session
+            .write_options()
+            .write(&mut w, fact.into_array().to_array_stream())
+            .await?;
+        w.shutdown().await?;
+    }
+
+    // The build key includes a NULL → DataFusion's InList carries a null literal, which converts
+    // to a *nullable* element scalar alongside the non-null (NonNullable) ones — the panic trigger.
+    let dim_k = PrimitiveArray::new(
+        buffer![2_i32, 7000, 0],
+        Validity::from_iter([true, true, false]),
+    )
+    .into_array();
+    let dim = StructArray::try_new(["k"].into(), vec![dim_k], 3, Validity::NonNullable)?;
+    {
+        let mut w = ObjectStoreWrite::new(Arc::clone(&store), &"dim.vortex".into()).await?;
+        session
+            .write_options()
+            .write(&mut w, dim.into_array().to_array_stream())
+            .await?;
+        w.shutdown().await?;
+    }
+
+    let ctx = join_ctx(Arc::clone(&store), true);
+    let result = ctx
+        .sql("SELECT f.k FROM '/fact.vortex' f JOIN '/dim.vortex' d ON f.k = d.k ORDER BY f.k")
+        .await?
+        .collect()
+        .await?;
+    assert_eq!(batch_values(&result), vec![2, 7000]);
+    Ok(())
+}
+
+/// Capability A audit: a large-build join (the min/max bounds prune-only path) on a **nullable**
+/// key must also stay total. The bound literals are non-null, so there's no list null-mixing — this
+/// guards that the bound construction doesn't abort on nullable columns.
+#[tokio::test]
+async fn dynamic_bounds_nullable_key_does_not_abort() -> anyhow::Result<()> {
+    let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+    let session = VortexSession::default();
+
+    let nullable_i32 = |vals: Vec<i32>| {
+        PrimitiveArray::new(Buffer::from_iter(vals), Validity::AllValid).into_array()
+    };
+
+    let fact = StructArray::try_new(
+        ["k", "v"].into(),
+        vec![
+            nullable_i32((0..10_000).collect()),
+            nullable_i32((0..10_000).collect()),
+        ],
+        10_000,
+        Validity::NonNullable,
+    )?;
+    {
+        let mut w = ObjectStoreWrite::new(Arc::clone(&store), &"fact.vortex".into()).await?;
+        session
+            .write_options()
+            .write(&mut w, fact.into_array().to_array_stream())
+            .await?;
+        w.shutdown().await?;
+    }
+
+    // > 150 distinct keys → hash_lookup + min/max bounds (no InList) → capability A prune-only path.
+    let dim = StructArray::try_new(
+        ["k"].into(),
+        vec![nullable_i32((0..160).collect())],
+        160,
+        Validity::NonNullable,
+    )?;
+    {
+        let mut w = ObjectStoreWrite::new(Arc::clone(&store), &"dim.vortex".into()).await?;
+        session
+            .write_options()
+            .write(&mut w, dim.into_array().to_array_stream())
+            .await?;
+        w.shutdown().await?;
+    }
+
+    let ctx = join_ctx(Arc::clone(&store), true);
+    let result = ctx
+        .sql("SELECT f.k FROM '/fact.vortex' f JOIN '/dim.vortex' d ON f.k = d.k ORDER BY f.k")
+        .await?
+        .collect()
+        .await?;
+    assert_eq!(batch_values(&result), (0..160).collect::<Vec<i32>>());
     Ok(())
 }
 

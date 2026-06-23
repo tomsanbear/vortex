@@ -444,7 +444,7 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
 
         if let Some(in_list) = df.downcast_ref::<df_expr::InListExpr>() {
             let value = self.convert(in_list.expr().as_ref())?;
-            let list_elements: Vec<_> = in_list
+            let list_elements: Vec<Scalar> = in_list
                 .list()
                 .iter()
                 .map(|e| {
@@ -456,11 +456,23 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
                 })
                 .try_collect()?;
 
-            let list = Scalar::list(
-                list_elements[0].dtype().clone(),
-                list_elements,
-                Nullability::Nullable,
-            );
+            // DataFusion's InList can mix null and non-null literals, which `from_df` maps to
+            // different nullability (a null → nullable element, a value → non-nullable). Build the
+            // list with a single *nullable* element dtype and coerce every element to it, so the
+            // list constructor never sees a dtype divergence (which would `vortex_panic!`).
+            // Erroring here is safe: the dynamic path degrades to file-level pruning, and a static
+            // InList falls back to DataFusion — neither aborts.
+            let element_dtype = list_elements
+                .first()
+                .ok_or_else(|| exec_datafusion_err!("InList with no elements"))?
+                .dtype()
+                .as_nullable();
+            let list_elements = list_elements
+                .iter()
+                .map(|scalar| scalar.cast(&element_dtype))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| exec_datafusion_err!("InList element not coercible: {e}"))?;
+            let list = Scalar::list(element_dtype, list_elements, Nullability::Nullable);
             let expr = list_contains(lit(list), value);
 
             return Ok(if in_list.negated() { not(expr) } else { expr });
@@ -1460,5 +1472,67 @@ mod tests {
             dynamic_prune_bounds_predicate(&convertor, &snapshot, &schema).is_none(),
             "bounds must not be pushed when a convertible InList is present (small build)"
         );
+    }
+
+    /// The dynamic-conversion seam must be **total** — for any key dtype × nullability × encoding,
+    /// converting an `InList` (including a null-mixing list) returns `Some`/`None`, never panics.
+    /// (Reachable from runtime build-side data across QuiltDB's FFI, where a panic is a SIGABRT.)
+    #[test]
+    fn dynamic_inscan_predicate_is_total_across_dtypes_and_nullability() {
+        let convertor = DefaultExpressionConvertor::default();
+        let cases: Vec<(DataType, Vec<ScalarValue>)> = vec![
+            (
+                DataType::Int32,
+                vec![
+                    ScalarValue::Int32(Some(1)),
+                    ScalarValue::Int32(None),
+                    ScalarValue::Int32(Some(2)),
+                ],
+            ),
+            (
+                DataType::Int64,
+                vec![ScalarValue::Int64(Some(1)), ScalarValue::Int64(None)],
+            ),
+            (
+                DataType::Float64,
+                vec![ScalarValue::Float64(Some(1.0)), ScalarValue::Float64(None)],
+            ),
+            (
+                DataType::Boolean,
+                vec![ScalarValue::Boolean(Some(true)), ScalarValue::Boolean(None)],
+            ),
+            (
+                DataType::Utf8,
+                vec![ScalarValue::Utf8(Some("a".into())), ScalarValue::Utf8(None)],
+            ),
+            (
+                DataType::Utf8View,
+                vec![
+                    ScalarValue::Utf8View(Some("a".into())),
+                    ScalarValue::Utf8View(None),
+                ],
+            ),
+            (
+                DataType::Decimal128(10, 2),
+                vec![
+                    ScalarValue::Decimal128(Some(100), 10, 2),
+                    ScalarValue::Decimal128(None, 10, 2),
+                ],
+            ),
+        ];
+
+        for (data_type, values) in cases {
+            let schema = Schema::new(vec![Field::new("k", data_type.clone(), true)]);
+            let col = Arc::new(df_expr::Column::new("k", 0)) as Arc<dyn PhysicalExpr>;
+            let list: Vec<Arc<dyn PhysicalExpr>> = values
+                .into_iter()
+                .map(|v| Arc::new(df_expr::Literal::new(v)) as Arc<dyn PhysicalExpr>)
+                .collect();
+            let Ok(inlist) = df_expr::in_list(col, list, &false, &schema) else {
+                continue; // DataFusion couldn't build this InList; not our seam.
+            };
+            // Must return — Some (pushed) or None (degraded) — and never panic for any dtype.
+            let _converted = dynamic_inscan_predicate(&convertor, &inlist, &schema);
+        }
     }
 }
