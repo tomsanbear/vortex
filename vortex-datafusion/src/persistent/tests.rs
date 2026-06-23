@@ -755,6 +755,75 @@ async fn dynamic_inlist_filter_applied_to_probe_scan() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Confirm the dynamic InList still produces correct results under a multi-partition, file-scan
+/// repartitioned plan (`make_session(.., true)` → `target_partitions(4)` + repartition) — closer to
+/// real execution than the single-partition determinism tests above, and exercising the
+/// repartition path that #18513 concerned.
+#[tokio::test]
+async fn dynamic_inlist_correct_multi_partition() -> anyhow::Result<()> {
+    let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+    let session = VortexSession::default();
+
+    let fact = StructArray::try_new(
+        ["k", "v"].into(),
+        vec![
+            ChunkedArray::from_iter([
+                Buffer::from_iter(0_i32..5_000).into_array(),
+                Buffer::from_iter(5_000_i32..10_000).into_array(),
+            ])
+            .into_array(),
+            ChunkedArray::from_iter([
+                Buffer::from_iter(0_i32..5_000).into_array(),
+                Buffer::from_iter(5_000_i32..10_000).into_array(),
+            ])
+            .into_array(),
+        ],
+        10_000,
+        Validity::NonNullable,
+    )?;
+    {
+        let mut w = ObjectStoreWrite::new(Arc::clone(&store), &"fact.vortex".into()).await?;
+        session
+            .write_options()
+            .write(&mut w, fact.into_array().to_array_stream())
+            .await?;
+        w.shutdown().await?;
+    }
+
+    let dim = StructArray::try_new(
+        ["k", "label"].into(),
+        vec![
+            buffer![2_i32, 7_000].into_array(),
+            buffer![100_i32, 100].into_array(),
+        ],
+        2,
+        Validity::NonNullable,
+    )?;
+    {
+        let mut w = ObjectStoreWrite::new(Arc::clone(&store), &"dim.vortex".into()).await?;
+        session
+            .write_options()
+            .write(&mut w, dim.into_array().to_array_stream())
+            .await?;
+        w.shutdown().await?;
+    }
+
+    // 4 partitions + file-scan repartitioning.
+    let ctx = make_session(Arc::clone(&store), true);
+    let result = ctx
+        .sql("SELECT f.k FROM '/fact.vortex' f JOIN '/dim.vortex' d ON f.k = d.k ORDER BY f.k")
+        .await?
+        .collect()
+        .await?;
+    assert_eq!(
+        batch_values(&result),
+        vec![2, 7000],
+        "multi-partition join result must match"
+    );
+
+    Ok(())
+}
+
 /// Dynamic-path adapter-rewrite under schema evolution: the probe file stores the join key `k` as
 /// `Int16`, but the table declares it `INT` (`Int32`). The dynamic `InList` (built from `Int32` dim
 /// keys) must be snapshotted and adapter-rewritten to the file's physical type, then still applied
@@ -826,6 +895,100 @@ async fn dynamic_inlist_applied_under_schema_evolution() -> anyhow::Result<()> {
         "dynamic InList must apply in-scan despite schema evolution; plan:\n{plan}"
     );
 
+    Ok(())
+}
+
+/// MEASUREMENT (compare `VORTEX_DYNAMIC_INSCAN` on vs off): the in-scan InList's I/O win where it
+/// fires. The key `k` is sorted (clustered) so the zoned layout's coarse zones get tight min/max;
+/// `v` is a high-entropy payload (expensive to read) and is what the query projects. The dim's keys
+/// fall only in the first coarse zone, so the in-scan InList prunes the other zones and skips their
+/// payload reads (file-level pruning can't — the one file's stats span the whole key range).
+#[tokio::test]
+async fn measure_dynamic_inlist_bytes_read() -> anyhow::Result<()> {
+    use datafusion::physical_plan::collect;
+
+    use crate::persistent::metrics::VortexMetricsFinder;
+
+    let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+    let session = VortexSession::default();
+
+    // 1M rows. `k` is sorted/contiguous → clustered, so the layout's coarse zones get tight min/max
+    // and the in-scan InList can prune them. `v` is a high-entropy payload (expensive to read) and
+    // is what we project, so pruning skips its reads for pruned zones. The dim keys all fall in the
+    // first coarse zone.
+    let n_chunks = 100_i32;
+    let chunk_len = 10_000_i32;
+    let k_chunks: Vec<_> = (0..n_chunks)
+        .map(|c| Buffer::from_iter((c * chunk_len)..(c * chunk_len + chunk_len)).into_array())
+        .collect();
+    let v_chunks: Vec<_> = (0..n_chunks)
+        .map(|c| {
+            let base = (c * chunk_len) as u32;
+            Buffer::from_iter(
+                (0..chunk_len as u32)
+                    .map(|j| base.wrapping_add(j).wrapping_mul(2_654_435_761) as i32),
+            )
+            .into_array()
+        })
+        .collect();
+    let fact = StructArray::try_new(
+        ["k", "v"].into(),
+        vec![
+            ChunkedArray::from_iter(k_chunks).into_array(),
+            ChunkedArray::from_iter(v_chunks).into_array(),
+        ],
+        (n_chunks * chunk_len) as usize,
+        Validity::NonNullable,
+    )?;
+    {
+        let mut w = ObjectStoreWrite::new(Arc::clone(&store), &"fact.vortex".into()).await?;
+        session
+            .write_options()
+            .write(&mut w, fact.into_array().to_array_stream())
+            .await?;
+        w.shutdown().await?;
+    }
+
+    // 3 keys, all in the first zone (< chunk_len) → InList; the other zones are prunable.
+    let dim = StructArray::try_new(
+        ["k"].into(),
+        vec![buffer![5_i32, 50, 500].into_array()],
+        3,
+        Validity::NonNullable,
+    )?;
+    {
+        let mut w = ObjectStoreWrite::new(Arc::clone(&store), &"dim.vortex".into()).await?;
+        session
+            .write_options()
+            .write(&mut w, dim.into_array().to_array_stream())
+            .await?;
+        w.shutdown().await?;
+    }
+
+    let ctx = join_ctx(Arc::clone(&store), true);
+    let (state, logical) = ctx
+        .sql("SELECT f.v FROM '/fact.vortex' f JOIN '/dim.vortex' d ON f.k = d.k")
+        .await?
+        .into_parts();
+    let plan = state.create_physical_plan(&logical).await?;
+    let result = collect(Arc::clone(&plan), state.task_ctx()).await?;
+
+    let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
+    let sets = VortexMetricsFinder::find_all(plan.as_ref());
+    let enabled = std::env::var("VORTEX_DYNAMIC_INSCAN")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    println!(
+        "MEASURE dynamic_inscan_enabled={enabled} result_rows={total_rows} n_scans={}",
+        sets.len()
+    );
+    for (i, set) in sets.iter().enumerate() {
+        for metric in set.aggregate_by_name().sorted_for_display().iter() {
+            println!("  scan[{i}] {metric}");
+        }
+    }
+
+    assert_eq!(total_rows, 3, "join should return the 3 matching rows");
     Ok(())
 }
 

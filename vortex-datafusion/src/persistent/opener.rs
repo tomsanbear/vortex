@@ -3,6 +3,7 @@
 
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::Weak;
 
 use arrow_array::RecordBatchOptions;
@@ -67,6 +68,15 @@ use crate::metrics::PATH_LABEL;
 use crate::persistent::cache::CachedVortexMetadata;
 use crate::persistent::reader::VortexReaderFactory;
 use crate::persistent::stream::PrunableStream;
+
+/// Whether to route a pushed-down dynamic filter's selective `InList` into the in-scan filter
+/// (on by default). `VORTEX_DYNAMIC_INSCAN=0` disables it — the dynamic still feeds the file-level
+/// `FilePruner`, which isolates the in-scan contribution when measuring and acts as a kill-switch.
+static DYNAMIC_INSCAN_ENABLED: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("VORTEX_DYNAMIC_INSCAN")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true)
+});
 
 #[derive(Clone)]
 pub(crate) struct VortexOpener {
@@ -402,26 +412,30 @@ impl FileOpener for VortexOpener {
             // and simplify the *static* result so its column references match this file. Snapshotting
             // first means the adapter never has to recurse into the dynamic wrapper. Only the
             // convertible `InList` is pushed; non-selective min/max is left to file-level pruning.
-            let dynamic_inscan = dynamic_filter_predicate.as_ref().and_then(|predicate| {
-                let exprs = split_conjunction(predicate)
-                    .into_iter()
-                    .filter_map(|conjunct| {
-                        if !is_dynamic_physical_expr(conjunct) {
-                            return None;
-                        }
-                        let snapshot = snapshot_physical_expr(Arc::clone(conjunct)).ok()?;
-                        let rewritten = simplifier
-                            .simplify(expr_adapter.rewrite(snapshot).ok()?)
-                            .ok()?;
-                        dynamic_inscan_predicate(
-                            expr_convertor.as_ref(),
-                            &rewritten,
-                            &this_file_schema,
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                and_collect(exprs)
-            });
+            let dynamic_inscan = if *DYNAMIC_INSCAN_ENABLED {
+                dynamic_filter_predicate.as_ref().and_then(|predicate| {
+                    let exprs = split_conjunction(predicate)
+                        .into_iter()
+                        .filter_map(|conjunct| {
+                            if !is_dynamic_physical_expr(conjunct) {
+                                return None;
+                            }
+                            let snapshot = snapshot_physical_expr(Arc::clone(conjunct)).ok()?;
+                            let rewritten = simplifier
+                                .simplify(expr_adapter.rewrite(snapshot).ok()?)
+                                .ok()?;
+                            dynamic_inscan_predicate(
+                                expr_convertor.as_ref(),
+                                &rewritten,
+                                &this_file_schema,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    and_collect(exprs)
+                })
+            } else {
+                None
+            };
             let filter = and_collect(filter.into_iter().chain(dynamic_inscan).collect::<Vec<_>>());
 
             if let Some(limit) = limit
