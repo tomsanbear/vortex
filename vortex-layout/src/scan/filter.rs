@@ -18,6 +18,22 @@ use vortex_error::vortex_panic;
 /// The selectivity histogram quantile to use for reordering conjuncts. Where 0 == no rows match.
 const DEFAULT_SELECTIVITY_QUANTILE: f64 = 0.1;
 
+/// How a filter conjunct participates in scan evaluation.
+///
+/// Zone pruning (stat falsification) is always attempted for every conjunct in `split_exec`'s
+/// initial pass — it is cheap and no-ops for predicates that can't be falsified against stats. This
+/// enum therefore selects only whether the conjunct *also* runs the per-row `filter_evaluation`
+/// pass.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ConjunctEval {
+    /// Zone-prune via stats, then refine per-row. The default for selective predicates.
+    PruneAndFilter,
+    /// Zone-prune via stats only; skip the per-row pass. For non-selective bounds (e.g. a hash-join
+    /// `col >= min AND col <= max`) where per-row evaluation is pure decode cost with no
+    /// selectivity benefit.
+    PruneOnly,
+}
+
 /// A [`FilterExpr`] splits boolean expressions into individual conjunctions, tracks
 /// statistics about selectivity, and uses this information to reorder the evaluation of the
 /// conjunctions in an attempt to minimize the work done.
@@ -32,6 +48,8 @@ pub struct FilterExpr {
     ordering: RwLock<Vec<usize>>,
     /// The quantile to use from the selectivity histogram of each conjunct.
     selectivity_quantile: f64,
+    /// Per-conjunct evaluation mode (parallel to `conjuncts`).
+    eval: Vec<ConjunctEval>,
 }
 
 fn bound_conjuncts(expr: &BoundExpression) -> Vec<BoundExpression> {
@@ -54,8 +72,34 @@ fn bound_conjuncts(expr: &BoundExpression) -> Vec<BoundExpression> {
 }
 
 impl FilterExpr {
+    #[cfg(test)]
     pub fn new(expr: BoundExpression) -> Self {
-        let conjuncts = bound_conjuncts(&expr);
+        Self::with_prune_only(Some(expr), None)
+    }
+
+    /// Build a filter from a `row_filter` (each conjunct drives zone pruning *and* a per-row pass)
+    /// and an optional `prune_filter` (each conjunct drives zone pruning but **skips** the per-row
+    /// pass). Use `prune_filter` for non-selective bounds — e.g. a hash-join `col >= min AND col <=
+    /// max` — where the per-row pass is pure decode cost with no selectivity benefit.
+    pub fn with_prune_only(
+        row_filter: Option<BoundExpression>,
+        prune_filter: Option<BoundExpression>,
+    ) -> Self {
+        let row_conjuncts = row_filter.as_ref().map(bound_conjuncts).unwrap_or_default();
+        let prune_conjuncts = prune_filter
+            .as_ref()
+            .map(bound_conjuncts)
+            .unwrap_or_default();
+
+        let eval: Vec<ConjunctEval> =
+            iter::repeat_n(ConjunctEval::PruneAndFilter, row_conjuncts.len())
+                .chain(iter::repeat_n(
+                    ConjunctEval::PruneOnly,
+                    prune_conjuncts.len(),
+                ))
+                .collect();
+        let conjuncts: Vec<BoundExpression> =
+            row_conjuncts.into_iter().chain(prune_conjuncts).collect();
         let num_conjuncts = conjuncts.len();
 
         let dynamic_conjuncts = conjuncts
@@ -73,7 +117,14 @@ impl FilterExpr {
             // comparison operator to perform. e.g. == might be more selective than <=? Not obvious.
             ordering: RwLock::new((0..num_conjuncts).collect()),
             selectivity_quantile: DEFAULT_SELECTIVITY_QUANTILE,
+            eval,
         }
+    }
+
+    /// The evaluation mode of the conjunct at `conjunct_idx`.
+    #[inline]
+    pub fn conjunct_eval(&self, conjunct_idx: usize) -> ConjunctEval {
+        self.eval[conjunct_idx]
     }
 
     /// The conjuncts that make up this filter expression.

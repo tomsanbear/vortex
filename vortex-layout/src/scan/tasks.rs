@@ -17,6 +17,7 @@ use vortex_mask::Mask;
 use vortex_scan::row_mask::RowMask;
 
 use crate::LayoutReader;
+use crate::scan::filter::ConjunctEval;
 use crate::scan::filter::FilterExpr;
 
 pub type TaskFuture<A> = BoxFuture<'static, VortexResult<A>>;
@@ -115,6 +116,14 @@ pub fn split_exec<A: 'static + Send>(
                     }
                     if mask.all_false() {
                         return Ok(mask);
+                    }
+
+                    // Prune-only conjuncts have already driven zone pruning above (initial pass +
+                    // dynamic re-prune); skip their per-row pass — evaluating a non-selective bound
+                    // per row is pure decode cost with no selectivity benefit.
+                    match filter.conjunct_eval(idx) {
+                        ConjunctEval::PruneOnly => continue,
+                        ConjunctEval::PruneAndFilter => {}
                     }
 
                     let conjunct_mask = reader

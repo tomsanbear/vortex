@@ -61,6 +61,7 @@ use crate::VortexAccessPlan;
 use crate::convert::exprs::ExpressionConvertor;
 use crate::convert::exprs::ProcessedProjection;
 use crate::convert::exprs::dynamic_inscan_predicate;
+use crate::convert::exprs::dynamic_prune_bounds_predicate;
 use crate::convert::exprs::make_vortex_predicate;
 use crate::convert::schema::calculate_physical_schema;
 use crate::metrics::PARTITION_LABEL;
@@ -407,39 +408,46 @@ impl FileOpener for VortexOpener {
                 })
                 .transpose()?;
 
-            // Route a pushed-down dynamic filter's selective `InList` into the in-scan filter.
-            // Snapshot the dynamic (materialized once the build side completes), then adapter-rewrite
-            // and simplify the *static* result so its column references match this file. Snapshotting
-            // first means the adapter never has to recurse into the dynamic wrapper. Only the
-            // convertible `InList` is pushed; non-selective min/max is left to file-level pruning.
-            let dynamic_inscan = if *DYNAMIC_INSCAN_ENABLED {
-                dynamic_filter_predicate.as_ref().and_then(|predicate| {
-                    let exprs = split_conjunction(predicate)
-                        .into_iter()
-                        .filter_map(|conjunct| {
-                            if !is_dynamic_physical_expr(conjunct) {
-                                return None;
-                            }
-                            let snapshot = snapshot_physical_expr(Arc::clone(conjunct)).ok()?;
-                            let rewritten = simplifier
-                                .simplify(expr_adapter.rewrite(snapshot).ok()?)
-                                .ok()?;
-                            dynamic_inscan_predicate(
-                                expr_convertor.as_ref(),
-                                &rewritten,
-                                &this_file_schema,
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    and_collect(exprs)
-                })
-            } else {
-                None
-            };
+            // Route a pushed-down dynamic filter into the scan. Snapshot the dynamic (materialized
+            // once the build side completes), then adapter-rewrite and simplify the *static* result
+            // so its column references match this file (snapshotting first keeps the adapter out of
+            // the dynamic wrapper). Two shapes are pushed: a selective `InList` (small build) becomes
+            // an in-scan filter (zone-prune + per-row); the non-selective `col >= min AND col <= max`
+            // bounds of a large build become a *prune-only* filter (zone-prune via stats, no per-row
+            // decode). The unrepresentable `hash_lookup`, and any min/max redundant with an `InList`,
+            // are left to file-level pruning.
+            let mut dynamic_inscan = Vec::new();
+            let mut dynamic_prune = Vec::new();
+            if *DYNAMIC_INSCAN_ENABLED && let Some(predicate) = dynamic_filter_predicate.as_ref() {
+                for conjunct in split_conjunction(predicate) {
+                    if !is_dynamic_physical_expr(conjunct) {
+                        continue;
+                    }
+                    let Some(rewritten) = snapshot_physical_expr(Arc::clone(conjunct))
+                        .ok()
+                        .and_then(|snapshot| expr_adapter.rewrite(snapshot).ok())
+                        .and_then(|rewritten| simplifier.simplify(rewritten).ok())
+                    else {
+                        continue;
+                    };
+                    dynamic_inscan.extend(dynamic_inscan_predicate(
+                        expr_convertor.as_ref(),
+                        &rewritten,
+                        &this_file_schema,
+                    ));
+                    dynamic_prune.extend(dynamic_prune_bounds_predicate(
+                        expr_convertor.as_ref(),
+                        &rewritten,
+                        &this_file_schema,
+                    ));
+                }
+            }
+            let dynamic_prune = and_collect(dynamic_prune);
             let filter = and_collect(filter.into_iter().chain(dynamic_inscan).collect::<Vec<_>>());
 
             if let Some(limit) = limit
                 && filter.is_none()
+                && dynamic_prune.is_none()
             {
                 scan_builder = scan_builder.with_limit(limit);
             }
@@ -452,7 +460,8 @@ impl FileOpener for VortexOpener {
             // the fields the scan's projection and filter reference.
             scan_builder = scan_builder
                 .with_projection(scan_projection)
-                .with_some_filter(filter);
+                .with_some_filter(filter)
+                .with_some_prune_filter(dynamic_prune);
 
             if let Some(file_range) = file.range {
                 let byte_range = Range {

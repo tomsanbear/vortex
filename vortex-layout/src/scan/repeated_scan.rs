@@ -40,6 +40,8 @@ pub struct RepeatedScan<A: 'static + Send> {
     layout_reader: LayoutReaderRef,
     projection: BoundExpression,
     filter: Option<BoundExpression>,
+    /// Prune-only conjuncts: drive zone pruning but skip the per-row pass.
+    prune_filter: Option<BoundExpression>,
     ordered: bool,
     /// Optionally read a subset of the rows in the file.
     row_range: Option<Range<u64>>,
@@ -94,6 +96,7 @@ impl<A: 'static + Send> RepeatedScan<A> {
         layout_reader: LayoutReaderRef,
         projection: BoundExpression,
         filter: Option<BoundExpression>,
+        prune_filter: Option<BoundExpression>,
         ordered: bool,
         row_range: Option<Range<u64>>,
         selection: Selection,
@@ -108,6 +111,7 @@ impl<A: 'static + Send> RepeatedScan<A> {
             layout_reader,
             projection,
             filter,
+            prune_filter,
             ordered,
             row_range,
             selection,
@@ -174,7 +178,12 @@ impl<A: 'static + Send> RepeatedScan<A> {
         let mut limit = self.limit;
         let mut tasks = Vec::new();
         let ctx = Arc::new(TaskContext {
-            filter: self.filter.clone().map(|f| Arc::new(FilterExpr::new(f))),
+            filter: (self.filter.is_some() || self.prune_filter.is_some()).then(|| {
+                Arc::new(FilterExpr::with_prune_only(
+                    self.filter.clone(),
+                    self.prune_filter.clone(),
+                ))
+            }),
             reader: Arc::clone(&self.layout_reader),
             projection: self.projection.clone(),
             mapper: Arc::clone(&self.map_fn),

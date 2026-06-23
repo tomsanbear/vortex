@@ -19,6 +19,7 @@ use vortex_array::dtype::FieldMask;
 use vortex_array::expr::BoundExpression;
 use vortex_array::expr::Expression;
 use vortex_array::expr::analysis::referenced_field_paths;
+use vortex_array::expr::and_collect;
 use vortex_array::expr::root;
 use vortex_array::iter::ArrayIterator;
 use vortex_array::iter::ArrayIteratorAdapter;
@@ -63,6 +64,8 @@ pub struct ScanBuilder<A> {
     layout_reader: LayoutReaderRef,
     projection: Expression,
     filter: Option<Expression>,
+    /// Prune-only conjuncts: drive zone pruning but skip the per-row pass.
+    prune_filter: Option<Expression>,
     /// Whether the scan needs to return splits in the order they appear in the file.
     ordered: bool,
     /// Optionally read a subset of the rows in the file.
@@ -97,6 +100,7 @@ impl ScanBuilder<ArrayRef> {
             layout_reader,
             projection: root(),
             filter: None,
+            prune_filter: None,
             ordered: true,
             row_range: None,
             selection: Default::default(),
@@ -146,6 +150,13 @@ impl<A: 'static + Send> ScanBuilder<A> {
     /// Add or clear the filter expression.
     pub fn with_some_filter(mut self, filter: Option<Expression>) -> Self {
         self.filter = filter;
+        self
+    }
+
+    /// Set a prune-only filter: each conjunct drives zone pruning (via stats) but skips the
+    /// per-row pass. Use for non-selective bounds where per-row evaluation is pure decode cost.
+    pub fn with_some_prune_filter(mut self, prune_filter: Option<Expression>) -> Self {
+        self.prune_filter = prune_filter;
         self
     }
 
@@ -292,6 +303,7 @@ impl<A: 'static + Send> ScanBuilder<A> {
             layout_reader: self.layout_reader,
             projection: self.projection,
             filter: self.filter,
+            prune_filter: self.prune_filter,
             ordered: self.ordered,
             row_range: self.row_range,
             selection: self.selection,
@@ -341,37 +353,54 @@ impl<A: 'static + Send> ScanBuilder<A> {
             .map(|f| f.optimize_recursive(layout_reader.dtype()))
             .transpose()?;
 
+        let prune_filter = self
+            .prune_filter
+            .map(|f| f.optimize_recursive(layout_reader.dtype()))
+            .transpose()?;
+
         let bound_projection = projection.bind(layout_reader.dtype())?;
         let bound_filter = filter
             .as_ref()
             .map(|expr| expr.bind(layout_reader.dtype()))
             .transpose()?;
+        let bound_prune_filter = prune_filter
+            .as_ref()
+            .map(|expr| expr.bind(layout_reader.dtype()))
+            .transpose()?;
+
+        // The field masks below include both the row filter and the prune-only filter so the
+        // pruned columns' zones are registered for stats-pruning.
+        let bound_mask_filter = and_collect(filter.iter().chain(prune_filter.iter()).cloned())
+            .map(|expr| expr.bind(layout_reader.dtype()))
+            .transpose()?;
 
         // Compute the row splits of the scan.
-        let splits =
-            if let Some(ranges) = attempt_split_ranges(&self.selection, self.row_range.as_ref()) {
-                Splits::Ranges(ranges)
-            } else if let Some(boundaries) = self.natural_splits {
-                // Caller-supplied full-file boundaries; execution clamps them to the row range.
-                Splits::Natural(boundaries)
-            } else {
-                let field_mask = referenced_field_masks(&bound_projection, bound_filter.as_ref())?;
-                let split_range = self
-                    .row_range
-                    .clone()
-                    .unwrap_or_else(|| 0..layout_reader.row_count());
-                Splits::Natural(
-                    self.split_by
-                        .splits(layout_reader.as_ref(), &split_range, &field_mask)?
-                        .into(),
-                )
-            };
+        let splits = if let Some(ranges) =
+            attempt_split_ranges(&self.selection, self.row_range.as_ref())
+        {
+            Splits::Ranges(ranges)
+        } else if let Some(boundaries) = self.natural_splits {
+            // Caller-supplied full-file boundaries; execution clamps them to the row range.
+            Splits::Natural(boundaries)
+        } else {
+            let field_mask = referenced_field_masks(&bound_projection, bound_mask_filter.as_ref())?;
+            let split_range = self
+                .row_range
+                .clone()
+                .unwrap_or_else(|| 0..layout_reader.row_count());
+            Splits::Natural(
+                self.split_by
+                    .splits(layout_reader.as_ref(), &split_range, &field_mask)?
+                    .into(),
+            )
+        };
 
         Ok(RepeatedScan::new(
             self.session.clone(),
             layout_reader,
             bound_projection,
             bound_filter,
+            bound_prune_filter,
             self.ordered,
             self.row_range,
             self.selection,

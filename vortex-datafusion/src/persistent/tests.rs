@@ -869,6 +869,98 @@ async fn topk_dynamic_threshold_not_pushed_in_scan() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// MEASUREMENT (capability A — large-build min/max bounds as prune-only): a >150-key build emits
+/// `col >= min AND col <= max` + an unrepresentable `hash_lookup` (no `InList`). With the dim's keys
+/// confined to a narrow range, the bound zone-prunes the probe's later zones — but as a *prune-only*
+/// filter it skips the per-row pass, so the probe emits surviving-zone rows (not the matches; the
+/// join filters those). Compare bytes read / output rows with `VORTEX_DYNAMIC_INSCAN` on vs off.
+#[tokio::test]
+async fn measure_dynamic_bounds_prune_only() -> anyhow::Result<()> {
+    use datafusion::physical_plan::collect;
+
+    use crate::persistent::metrics::VortexMetricsFinder;
+
+    let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+    let session = VortexSession::default();
+
+    // probe: 1M rows, k sorted (clustered → tight zone min/max), v high-entropy payload (expensive).
+    let n_chunks = 100_i32;
+    let chunk_len = 10_000_i32;
+    let k_chunks: Vec<_> = (0..n_chunks)
+        .map(|c| Buffer::from_iter((c * chunk_len)..(c * chunk_len + chunk_len)).into_array())
+        .collect();
+    let v_chunks: Vec<_> = (0..n_chunks)
+        .map(|c| {
+            let base = (c * chunk_len) as u32;
+            Buffer::from_iter(
+                (0..chunk_len as u32)
+                    .map(|j| base.wrapping_add(j).wrapping_mul(2_654_435_761) as i32),
+            )
+            .into_array()
+        })
+        .collect();
+    let fact = StructArray::try_new(
+        ["k", "v"].into(),
+        vec![
+            ChunkedArray::from_iter(k_chunks).into_array(),
+            ChunkedArray::from_iter(v_chunks).into_array(),
+        ],
+        (n_chunks * chunk_len) as usize,
+        Validity::NonNullable,
+    )?;
+    {
+        let mut w = ObjectStoreWrite::new(Arc::clone(&store), &"fact.vortex".into()).await?;
+        session
+            .write_options()
+            .write(&mut w, fact.into_array().to_array_stream())
+            .await?;
+        w.shutdown().await?;
+    }
+
+    // dim: 200 distinct keys (> 150 → hash_lookup, no InList) confined to [0, 1000) so the min/max
+    // bound excludes the probe's later zones.
+    let dim = StructArray::try_new(
+        ["k"].into(),
+        vec![Buffer::from_iter((0..200_i32).map(|i| i * 5)).into_array()],
+        200,
+        Validity::NonNullable,
+    )?;
+    {
+        let mut w = ObjectStoreWrite::new(Arc::clone(&store), &"dim.vortex".into()).await?;
+        session
+            .write_options()
+            .write(&mut w, dim.into_array().to_array_stream())
+            .await?;
+        w.shutdown().await?;
+    }
+
+    let ctx = join_ctx(Arc::clone(&store), true);
+    let (state, logical) = ctx
+        .sql("SELECT f.v FROM '/fact.vortex' f JOIN '/dim.vortex' d ON f.k = d.k")
+        .await?
+        .into_parts();
+    let plan = state.create_physical_plan(&logical).await?;
+    let result = collect(Arc::clone(&plan), state.task_ctx()).await?;
+
+    let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
+    let sets = VortexMetricsFinder::find_all(plan.as_ref());
+    let enabled = std::env::var("VORTEX_DYNAMIC_INSCAN")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    println!("MEASURE-A bounds_prune_only enabled={enabled} result_rows={total_rows}");
+    for (i, set) in sets.iter().enumerate() {
+        for metric in set.aggregate_by_name().sorted_for_display().iter() {
+            let m = metric.to_string();
+            if m.starts_with("output_rows") || m.contains("vortex.io.read.total_size") {
+                println!("  scan[{i}] {m}");
+            }
+        }
+    }
+
+    assert_eq!(total_rows, 200, "join should return the 200 matching rows");
+    Ok(())
+}
+
 /// Dynamic-path adapter-rewrite under schema evolution: the probe file stores the join key `k` as
 /// `Int16`, but the table declares it `INT` (`Int32`). The dynamic `InList` (built from `Int32` dim
 /// keys) must be snapshotted and adapter-rewritten to the file's physical type, then still applied

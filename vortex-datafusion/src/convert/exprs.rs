@@ -99,6 +99,49 @@ pub(crate) fn dynamic_inscan_predicate(
     and_collect(inlist)
 }
 
+/// Builds the *prune-only* Vortex predicate for a pushed-down dynamic filter, or `None` if there is
+/// nothing to prune with.
+///
+/// For a **large build** side (no convertible `InList` — only the wide `col >= min AND col <= max`
+/// bounds plus an unconvertible `hash_lookup`) the bounds are pushed as a prune-only filter: they
+/// drive zone pruning via min/max stats but skip the per-row pass, since a non-selective bound
+/// evaluated per row is pure decode cost. When a convertible `InList` is present (small build) the
+/// bounds are redundant with it, so this returns `None` and the `InList` is pushed by
+/// [`dynamic_inscan_predicate`] instead.
+pub(crate) fn dynamic_prune_bounds_predicate(
+    convertor: &dyn ExpressionConvertor,
+    snapshot: &Arc<dyn PhysicalExpr>,
+    schema: &Schema,
+) -> Option<Expression> {
+    let conjuncts = split_conjunction(snapshot);
+
+    let has_inlist = conjuncts.iter().any(|conjunct| {
+        conjunct.downcast_ref::<df_expr::InListExpr>().is_some()
+            && convertor.can_be_pushed_down(conjunct, schema)
+    });
+    if has_inlist {
+        return None;
+    }
+
+    let bounds = conjuncts
+        .into_iter()
+        .filter_map(|conjunct| {
+            let is_bound = conjunct
+                .downcast_ref::<df_expr::BinaryExpr>()
+                .is_some_and(|binary| {
+                    matches!(
+                        *binary.op(),
+                        DFOperator::Gt | DFOperator::GtEq | DFOperator::Lt | DFOperator::LtEq
+                    )
+                });
+            (is_bound && convertor.can_be_pushed_down(conjunct, schema))
+                .then(|| convertor.convert(conjunct.as_ref()).ok())
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    and_collect(bounds)
+}
+
 /// Trait for converting DataFusion expressions to Vortex ones.
 ///
 /// # Implementing a custom convertor
@@ -1372,6 +1415,50 @@ mod tests {
         assert!(
             dynamic_inscan_predicate(&convertor, &ge, &schema).is_none(),
             "bare min/max (no InList) must not be pushed in-scan"
+        );
+    }
+
+    #[test]
+    fn dynamic_prune_bounds_pushes_minmax_for_large_build() {
+        let convertor = DefaultExpressionConvertor::default();
+        let schema = Schema::new(vec![Field::new("k", DataType::Int32, false)]);
+        let col = || Arc::new(df_expr::Column::new("k", 0)) as Arc<dyn PhysicalExpr>;
+        let lit = |v: i32| {
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(v)))) as Arc<dyn PhysicalExpr>
+        };
+        let ge = Arc::new(df_expr::BinaryExpr::new(col(), DFOperator::GtEq, lit(2)))
+            as Arc<dyn PhysicalExpr>;
+        let le = Arc::new(df_expr::BinaryExpr::new(col(), DFOperator::LtEq, lit(7000)))
+            as Arc<dyn PhysicalExpr>;
+        let bounds =
+            Arc::new(df_expr::BinaryExpr::new(ge, DFOperator::And, le)) as Arc<dyn PhysicalExpr>;
+
+        let result = dynamic_prune_bounds_predicate(&convertor, &bounds, &schema)
+            .expect("large-build min/max bounds should be pushed as prune-only");
+        let s = result.to_string();
+        assert!(
+            s.contains('2') && s.contains("7000"),
+            "should convert both bounds, got: {s}"
+        );
+    }
+
+    #[test]
+    fn dynamic_prune_bounds_skips_when_inlist_present() {
+        let convertor = DefaultExpressionConvertor::default();
+        let schema = Schema::new(vec![Field::new("k", DataType::Int32, false)]);
+        let col = || Arc::new(df_expr::Column::new("k", 0)) as Arc<dyn PhysicalExpr>;
+        let lit = |v: i32| {
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(v)))) as Arc<dyn PhysicalExpr>
+        };
+        let ge = Arc::new(df_expr::BinaryExpr::new(col(), DFOperator::GtEq, lit(2)))
+            as Arc<dyn PhysicalExpr>;
+        let inlist = df_expr::in_list(col(), vec![lit(2), lit(7000)], &false, &schema).unwrap();
+        let snapshot = Arc::new(df_expr::BinaryExpr::new(ge, DFOperator::And, inlist))
+            as Arc<dyn PhysicalExpr>;
+
+        assert!(
+            dynamic_prune_bounds_predicate(&convertor, &snapshot, &schema).is_none(),
+            "bounds must not be pushed when a convertible InList is present (small build)"
         );
     }
 }
