@@ -617,3 +617,286 @@ async fn arrow_uuid_extension_roundtrip_nested_struct() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// Build a single-partition session with dynamic-filter pushdown toggleable, for join tests.
+fn join_ctx(store: Arc<dyn ObjectStore>, dynamic_filter_pushdown: bool) -> SessionContext {
+    let factory = Arc::new(VortexFormatFactory::new());
+    let mut config = SessionConfig::new().with_target_partitions(1);
+    config
+        .options_mut()
+        .optimizer
+        .enable_dynamic_filter_pushdown = dynamic_filter_pushdown;
+    let mut state = SessionStateBuilder::new()
+        .with_config(config)
+        .with_default_features()
+        .with_table_factory(
+            factory.get_ext().to_uppercase(),
+            Arc::new(DefaultTableFactory::new()),
+        )
+        .with_object_store(&url::Url::try_from("file://").unwrap(), store);
+    if let Some(file_formats) = state.file_formats() {
+        file_formats.push(factory as _);
+    }
+    SessionContext::new_with_state(state.build()).enable_url_table()
+}
+
+/// Extract the `output_rows=` value (e.g. "2" or "10.00 K") for the `DataSourceExec` line scanning
+/// the file named `file_substr`, from a pretty-printed `EXPLAIN ANALYZE` plan.
+fn probe_scan_output_rows(plan: &str, file_substr: &str) -> anyhow::Result<String> {
+    let line = plan
+        .lines()
+        .find(|l| l.contains("DataSourceExec") && l.contains(file_substr))
+        .ok_or_else(|| anyhow!("no DataSourceExec for {file_substr} in:\n{plan}"))?;
+    let start = line
+        .find("output_rows=")
+        .ok_or_else(|| anyhow!("no output_rows in: {line}"))?
+        + "output_rows=".len();
+    Ok(line[start..]
+        .split(',')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string())
+}
+
+/// ACCEPTANCE (red until Step 4): a small build side makes DataFusion emit a selective dynamic
+/// `InList` (k IN {2,7000}). Once we snapshot + route it into the Vortex scan, the probe-side scan
+/// must emit only the 2 matching rows (today it scans all 10k). Also guards #4144: results identical
+/// with dynamic-filter pushdown on and off (we report Unsupported to DF, so the join still filters).
+#[tokio::test]
+async fn dynamic_inlist_filter_applied_to_probe_scan() -> anyhow::Result<()> {
+    let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+    let session = VortexSession::default();
+
+    // fact / probe side: 10k rows across 2 chunks (multiple zones).
+    let fact = StructArray::try_new(
+        ["k", "v"].into(),
+        vec![
+            ChunkedArray::from_iter([
+                Buffer::from_iter(0_i32..5_000).into_array(),
+                Buffer::from_iter(5_000_i32..10_000).into_array(),
+            ])
+            .into_array(),
+            ChunkedArray::from_iter([
+                Buffer::from_iter(0_i32..5_000).into_array(),
+                Buffer::from_iter(5_000_i32..10_000).into_array(),
+            ])
+            .into_array(),
+        ],
+        10_000,
+        Validity::NonNullable,
+    )?;
+    {
+        let mut w = ObjectStoreWrite::new(Arc::clone(&store), &"fact.vortex".into()).await?;
+        session
+            .write_options()
+            .write(&mut w, fact.into_array().to_array_stream())
+            .await?;
+        w.shutdown().await?;
+    }
+
+    // dim / build side: 2 selective keys (one per fact chunk); 2 distinct < InList threshold (150).
+    let dim = StructArray::try_new(
+        ["k", "label"].into(),
+        vec![
+            buffer![2_i32, 7_000].into_array(),
+            buffer![100_i32, 100].into_array(),
+        ],
+        2,
+        Validity::NonNullable,
+    )?;
+    {
+        let mut w = ObjectStoreWrite::new(Arc::clone(&store), &"dim.vortex".into()).await?;
+        session
+            .write_options()
+            .write(&mut w, dim.into_array().to_array_stream())
+            .await?;
+        w.shutdown().await?;
+    }
+
+    let query = "SELECT f.k FROM '/fact.vortex' f JOIN '/dim.vortex' d ON f.k = d.k ORDER BY f.k";
+
+    // Correctness + #4144 guard: identical results with dynamic-filter pushdown on and off.
+    let on = join_ctx(Arc::clone(&store), true)
+        .sql(query)
+        .await?
+        .collect()
+        .await?;
+    let off = join_ctx(Arc::clone(&store), false)
+        .sql(query)
+        .await?
+        .collect()
+        .await?;
+    assert_eq!(
+        batch_values(&on),
+        vec![2, 7000],
+        "join result with pushdown on"
+    );
+    assert_eq!(
+        batch_values(&off),
+        batch_values(&on),
+        "dynamic-filter pushdown must not change results"
+    );
+
+    // Effect: the probe scan emits only the matching rows because the dynamic InList is routed
+    // into the Vortex scan (it scanned all 10k before this feature).
+    let explain = join_ctx(Arc::clone(&store), true)
+        .sql(&format!("EXPLAIN ANALYZE {query}"))
+        .await?
+        .collect()
+        .await?;
+    let plan = pretty_format_batches(&explain)?.to_string();
+    assert_eq!(
+        probe_scan_output_rows(&plan, "fact.vortex")?,
+        "2",
+        "probe scan should emit only the 2 matching rows; plan:\n{plan}"
+    );
+
+    Ok(())
+}
+
+/// Dynamic-path adapter-rewrite under schema evolution: the probe file stores the join key `k` as
+/// `Int16`, but the table declares it `INT` (`Int32`). The dynamic `InList` (built from `Int32` dim
+/// keys) must be snapshotted and adapter-rewritten to the file's physical type, then still applied
+/// in-scan — not silently dropped or errored. Asserts correct results AND that the probe scan emits
+/// only the matching rows (so the rewrite genuinely fired rather than being dropped).
+#[tokio::test]
+async fn dynamic_inlist_applied_under_schema_evolution() -> anyhow::Result<()> {
+    let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+    let session = VortexSession::default();
+
+    // fact / probe: join key `k` physically Int16 (the table declares it INT → scan upcasts).
+    let fact = StructArray::try_new(
+        ["k", "v"].into(),
+        vec![
+            buffer![0i16, 3, 5, 7, 8, 9].into_array(),
+            buffer![0i32, 30, 50, 70, 80, 90].into_array(),
+        ],
+        6,
+        Validity::NonNullable,
+    )?;
+    {
+        let mut w = ObjectStoreWrite::new(Arc::clone(&store), &"factdir/f1.vortex".into()).await?;
+        session
+            .write_options()
+            .write(&mut w, fact.into_array().to_array_stream())
+            .await?;
+        w.shutdown().await?;
+    }
+
+    // dim / build: 2 selective Int32 keys → dynamic InList {3, 7}.
+    let dim = StructArray::try_new(
+        ["k"].into(),
+        vec![buffer![3i32, 7].into_array()],
+        2,
+        Validity::NonNullable,
+    )?;
+    {
+        let mut w = ObjectStoreWrite::new(Arc::clone(&store), &"dimdir/d1.vortex".into()).await?;
+        session
+            .write_options()
+            .write(&mut w, dim.into_array().to_array_stream())
+            .await?;
+        w.shutdown().await?;
+    }
+
+    let ctx = join_ctx(Arc::clone(&store), true);
+    ctx.sql("CREATE EXTERNAL TABLE fact (k INT, v INT) STORED AS vortex LOCATION '/factdir/'")
+        .await?;
+    ctx.sql("CREATE EXTERNAL TABLE dim (k INT) STORED AS vortex LOCATION '/dimdir/'")
+        .await?;
+
+    let query = "SELECT f.k FROM fact f JOIN dim d ON f.k = d.k ORDER BY f.k";
+    let result = ctx.sql(query).await?.collect().await?;
+    assert_eq!(
+        batch_values(&result),
+        vec![3, 7],
+        "join result under Int16->Int32 schema evolution"
+    );
+
+    let explain = ctx
+        .sql(&format!("EXPLAIN ANALYZE {query}"))
+        .await?
+        .collect()
+        .await?;
+    let plan = pretty_format_batches(&explain)?.to_string();
+    assert_eq!(
+        probe_scan_output_rows(&plan, "f1.vortex")?,
+        "2",
+        "dynamic InList must apply in-scan despite schema evolution; plan:\n{plan}"
+    );
+
+    Ok(())
+}
+
+/// GUARD: a large build side (>150 distinct) yields a `hash_lookup` membership Vortex can't
+/// represent, leaving only non-selective min/max — which must NOT be pushed per-row. The probe
+/// scan must keep reading all rows (no in-scan filter), so this stays green after Step 4 too.
+#[tokio::test]
+async fn large_build_dynamic_not_pushed_in_scan() -> anyhow::Result<()> {
+    let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+    let session = VortexSession::default();
+
+    // fact / probe side: 10k rows across 2 chunks.
+    let fact = StructArray::try_new(
+        ["k", "v"].into(),
+        vec![
+            ChunkedArray::from_iter([
+                Buffer::from_iter(0_i32..5_000).into_array(),
+                Buffer::from_iter(5_000_i32..10_000).into_array(),
+            ])
+            .into_array(),
+            ChunkedArray::from_iter([
+                Buffer::from_iter(0_i32..5_000).into_array(),
+                Buffer::from_iter(5_000_i32..10_000).into_array(),
+            ])
+            .into_array(),
+        ],
+        10_000,
+        Validity::NonNullable,
+    )?;
+    {
+        let mut w = ObjectStoreWrite::new(Arc::clone(&store), &"fact2.vortex".into()).await?;
+        session
+            .write_options()
+            .write(&mut w, fact.into_array().to_array_stream())
+            .await?;
+        w.shutdown().await?;
+    }
+
+    // dim / build side: 300 distinct keys spanning the fact range → >150 distinct, min/max wide.
+    let dim = StructArray::try_new(
+        ["k", "label"].into(),
+        vec![
+            Buffer::from_iter((0_i32..300).map(|i| i * 33)).into_array(),
+            Buffer::from_iter((0_i32..300).map(|_| 100_i32)).into_array(),
+        ],
+        300,
+        Validity::NonNullable,
+    )?;
+    {
+        let mut w = ObjectStoreWrite::new(Arc::clone(&store), &"dim2.vortex".into()).await?;
+        session
+            .write_options()
+            .write(&mut w, dim.into_array().to_array_stream())
+            .await?;
+        w.shutdown().await?;
+    }
+
+    let explain = join_ctx(Arc::clone(&store), true)
+        .sql(
+            "EXPLAIN ANALYZE SELECT f.k FROM '/fact2.vortex' f \
+             JOIN '/dim2.vortex' d ON f.k = d.k",
+        )
+        .await?
+        .collect()
+        .await?;
+    let plan = pretty_format_batches(&explain)?.to_string();
+    assert_eq!(
+        probe_scan_output_rows(&plan, "fact2.vortex")?,
+        "10.00 K",
+        "large-build probe must not be filtered in-scan (hash_lookup unconvertible); plan:\n{plan}"
+    );
+
+    Ok(())
+}

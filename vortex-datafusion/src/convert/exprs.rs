@@ -19,6 +19,7 @@ use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::ScalarFunctionExpr;
 use datafusion_physical_expr::projection::ProjectionExpr;
 use datafusion_physical_expr::projection::ProjectionExprs;
+use datafusion_physical_expr::split_conjunction;
 use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr_common::physical_expr::is_dynamic_physical_expr;
 use datafusion_physical_plan::expressions as df_expr;
@@ -69,6 +70,33 @@ pub(crate) fn make_vortex_predicate(
         .collect::<DFResult<Vec<_>>>()?;
 
     Ok(and_collect(exprs))
+}
+
+/// Builds the in-scan Vortex predicate for a pushed-down dynamic filter, or `None` if it carries no
+/// selectively-pushable component.
+///
+/// `snapshot` is the materialized, schema-adapted static form of the dynamic filter — the caller
+/// snapshots and rewrites it to the file schema first. DataFusion materializes a hash-join dynamic
+/// filter to `col >= min AND col <= max AND <membership>`. For a small build side the membership is
+/// a convertible [`df_expr::InListExpr`] (selective — we push it); for a large build side it is an
+/// unconvertible `hash_lookup`, leaving only the wide non-selective min/max, which we deliberately
+/// leave to file-level pruning rather than evaluate per row. We therefore push only the convertible
+/// `InListExpr` conjunct(s).
+pub(crate) fn dynamic_inscan_predicate(
+    convertor: &dyn ExpressionConvertor,
+    snapshot: &Arc<dyn PhysicalExpr>,
+    schema: &Schema,
+) -> Option<Expression> {
+    let inlist = split_conjunction(snapshot)
+        .into_iter()
+        .filter_map(|conjunct| {
+            let is_inlist = conjunct.downcast_ref::<df_expr::InListExpr>().is_some();
+            (is_inlist && convertor.can_be_pushed_down(conjunct, schema))
+                .then(|| convertor.convert(conjunct.as_ref()).ok())
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    and_collect(inlist)
 }
 
 /// Trait for converting DataFusion expressions to Vortex ones.
@@ -1309,5 +1337,41 @@ mod tests {
         // value=20: > 10 -> 100
         assert_eq!(df_as_arrow, vec![0, 0, 50, 100, 100]);
         assert_eq!(vortex_as_arrow, df_as_arrow);
+    }
+
+    #[test]
+    fn dynamic_inscan_predicate_pushes_inlist() {
+        let convertor = DefaultExpressionConvertor::default();
+        let schema = Schema::new(vec![Field::new("k", DataType::Int32, false)]);
+        let col = Arc::new(df_expr::Column::new("k", 0)) as Arc<dyn PhysicalExpr>;
+        let list = vec![
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(2)))) as Arc<dyn PhysicalExpr>,
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(7000))))
+                as Arc<dyn PhysicalExpr>,
+        ];
+        let inlist = df_expr::in_list(col, list, &false, &schema).unwrap();
+
+        let result = dynamic_inscan_predicate(&convertor, &inlist, &schema)
+            .expect("convertible InList should be pushed in-scan");
+        assert!(
+            result.to_string().contains("contains"),
+            "should convert to list_contains, got: {result}"
+        );
+    }
+
+    #[test]
+    fn dynamic_inscan_predicate_skips_bare_minmax() {
+        let convertor = DefaultExpressionConvertor::default();
+        let schema = Schema::new(vec![Field::new("k", DataType::Int32, false)]);
+        let col = Arc::new(df_expr::Column::new("k", 0)) as Arc<dyn PhysicalExpr>;
+        let lit =
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(2)))) as Arc<dyn PhysicalExpr>;
+        let ge =
+            Arc::new(df_expr::BinaryExpr::new(col, DFOperator::GtEq, lit)) as Arc<dyn PhysicalExpr>;
+
+        assert!(
+            dynamic_inscan_predicate(&convertor, &ge, &schema).is_none(),
+            "bare min/max (no InList) must not be pushed in-scan"
+        );
     }
 }

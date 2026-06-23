@@ -29,6 +29,8 @@ use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr::utils::reassign_expr_columns;
 use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
 use datafusion_physical_expr_adapter::replace_columns_with_literals;
+use datafusion_physical_expr_common::physical_expr::is_dynamic_physical_expr;
+use datafusion_physical_expr_common::physical_expr::snapshot_physical_expr;
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion_physical_plan::metrics::MetricBuilder;
 use datafusion_physical_plan::metrics::MetricCategory;
@@ -42,6 +44,7 @@ use tracing::Instrument;
 use vortex::array::VortexSessionExecute;
 use vortex::error::VortexError;
 use vortex::error::VortexExpect;
+use vortex::expr::and_collect;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::io::InstrumentedReadAt;
 use vortex::layout::LayoutReader;
@@ -56,6 +59,7 @@ use vortex_utils::aliases::dash_map::Entry;
 use crate::VortexAccessPlan;
 use crate::convert::exprs::ExpressionConvertor;
 use crate::convert::exprs::ProcessedProjection;
+use crate::convert::exprs::dynamic_inscan_predicate;
 use crate::convert::exprs::make_vortex_predicate;
 use crate::convert::schema::calculate_physical_schema;
 use crate::metrics::PARTITION_LABEL;
@@ -188,6 +192,10 @@ impl FileOpener for VortexOpener {
                         .with_statistics(Arc::new(Statistics::new_unknown(&unified_file_schema)))
                 });
             let pruning_file = synthetic_statistics.as_ref().unwrap_or(&file);
+
+            // Clone before the FilePruner consumes `file_pruning_predicate`; reused below to route
+            // a pushed-down dynamic filter's selective InList into the in-scan filter.
+            let dynamic_filter_predicate = file_pruning_predicate.clone();
 
             let mut file_pruner = file_pruning_predicate
                 .filter(|_| file.has_statistics() || predicate_uses_partition_columns)
@@ -388,6 +396,33 @@ impl FileOpener for VortexOpener {
                     make_vortex_predicate(expr_convertor.as_ref(), &pushed).transpose()
                 })
                 .transpose()?;
+
+            // Route a pushed-down dynamic filter's selective `InList` into the in-scan filter.
+            // Snapshot the dynamic (materialized once the build side completes), then adapter-rewrite
+            // and simplify the *static* result so its column references match this file. Snapshotting
+            // first means the adapter never has to recurse into the dynamic wrapper. Only the
+            // convertible `InList` is pushed; non-selective min/max is left to file-level pruning.
+            let dynamic_inscan = dynamic_filter_predicate.as_ref().and_then(|predicate| {
+                let exprs = split_conjunction(predicate)
+                    .into_iter()
+                    .filter_map(|conjunct| {
+                        if !is_dynamic_physical_expr(conjunct) {
+                            return None;
+                        }
+                        let snapshot = snapshot_physical_expr(Arc::clone(conjunct)).ok()?;
+                        let rewritten = simplifier
+                            .simplify(expr_adapter.rewrite(snapshot).ok()?)
+                            .ok()?;
+                        dynamic_inscan_predicate(
+                            expr_convertor.as_ref(),
+                            &rewritten,
+                            &this_file_schema,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                and_collect(exprs)
+            });
+            let filter = and_collect(filter.into_iter().chain(dynamic_inscan).collect::<Vec<_>>());
 
             if let Some(limit) = limit
                 && filter.is_none()
