@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use num_traits::CheckedDiv;
-use num_traits::CheckedMul;
 use vortex_buffer::Buffer;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
@@ -22,6 +20,7 @@ use crate::dtype::NativeDecimalType;
 use crate::dtype::ToI256;
 use crate::dtype::i256;
 use crate::match_each_decimal_value_type;
+use crate::scalar::DecimalValue;
 use crate::scalar_fn::fns::cast::CastKernel;
 use crate::scalar_fn::fns::cast::CastReduce;
 
@@ -151,14 +150,6 @@ fn rescale_decimal_buffer(
     to_scale: i8,
 ) -> VortexResult<Buffer<i256>> {
     let from_scale = array.decimal_dtype().scale();
-    let delta = i32::from(to_scale) - i32::from(from_scale);
-    let magnitude = delta.unsigned_abs();
-    let factor = i256::from_i128(10)
-        .checked_pow(magnitude)
-        .ok_or_else(|| vortex_err!("decimal rescale factor 10^{magnitude} overflows i256"))?;
-    let widening = delta >= 0;
-    let half = factor / i256::from_i128(2);
-
     match_each_decimal_value_type!(array.values_type(), |F| {
         array
             .buffer::<F>()
@@ -167,17 +158,14 @@ fn rescale_decimal_buffer(
                 let v = v
                     .to_i256()
                     .vortex_expect("a native decimal value always widens to i256");
-                if widening {
-                    v.checked_mul(&factor).ok_or_else(|| {
-                        vortex_err!("decimal value overflows i256 when rescaling to scale {to_scale}")
+                DecimalValue::I256(v)
+                    .rescale(from_scale, to_scale)
+                    .map(|rescaled| rescaled.as_i256())
+                    .ok_or_else(|| {
+                        vortex_err!(
+                            "decimal value overflows i256 when rescaling to scale {to_scale}"
+                        )
                     })
-                } else {
-                    // Round half away from zero before truncating division.
-                    let rounded = if v >= i256::ZERO { v + half } else { v - half };
-                    rounded.checked_div(&factor).ok_or_else(|| {
-                        vortex_err!("decimal rescale division failed narrowing to scale {to_scale}")
-                    })
-                }
             })
             .collect::<VortexResult<Buffer<i256>>>()
     })

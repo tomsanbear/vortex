@@ -83,13 +83,27 @@ impl<'a> DecimalScalar<'a> {
                     );
                 }
 
-                // TODO(connor): Implement proper decimal scaling logic - whatever that means???
-                // Different precision/scale - need to implement scaling logic
-                // For now, we'll do a simple value preservation without scaling
-                if let Some(value) = &self.decimal_value {
-                    Ok(Scalar::decimal(*value, *target_dtype, *target_nullability))
-                } else {
-                    Ok(Scalar::null(dtype.clone()))
+                // Different precision/scale: rescale the mantissa by the scale
+                // delta (a precision-only change is a no-op since the scales are
+                // equal). Shares its rounding with the decimal array cast kernel,
+                // so a pushed-down filter's per-scalar cast and its array cast
+                // agree.
+                match self.decimal_value {
+                    Some(value) => {
+                        let rescaled = value
+                            .rescale(self.decimal_type.scale(), target_dtype.scale())
+                            .ok_or_else(|| {
+                                vortex_err!(
+                                    "decimal value {value} overflows when rescaling to {target_dtype}"
+                                )
+                            })?;
+                        Ok(Scalar::decimal(
+                            rescaled,
+                            *target_dtype,
+                            *target_nullability,
+                        ))
+                    }
+                    None => Ok(Scalar::null(dtype.clone())),
                 }
             }
             DType::Primitive(ptype, nullability) => {

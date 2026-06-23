@@ -238,16 +238,57 @@ mod tests {
     use vortex_buffer::buffer;
     use vortex_error::VortexExpect as _;
 
+    use vortex_buffer::buffer as vbuffer;
+
     use crate::IntoArray;
+    use crate::arrays::DecimalArray;
     use crate::arrays::StructArray;
     use crate::dtype::DType;
+    use crate::dtype::DecimalDType;
     use crate::dtype::Nullability;
     use crate::dtype::PType;
+    use crate::dtype::i256;
     use crate::expr::Expression;
     use crate::expr::cast;
     use crate::expr::get_item;
     use crate::expr::root;
     use crate::expr::test_harness;
+    use crate::scalar::DecimalValue;
+    use crate::scalar::Scalar;
+    use crate::validity::Validity;
+
+    #[test]
+    fn cast_expr_rescales_decimal_values() {
+        // The expr cast path (what vortex-datafusion's pushed-down filter uses)
+        // must rescale, not just relabel: 1.23, 6.78 at (10, 2) -> (20, 4)
+        // multiply each mantissa by 100.
+        let array = DecimalArray::new(
+            vbuffer![123i32, 678],
+            DecimalDType::new(10, 2),
+            Validity::NonNullable,
+        )
+        .into_array();
+        let to_dtype = DecimalDType::new(20, 4);
+        let to = DType::Decimal(to_dtype, Nullability::NonNullable);
+        let result = array.apply(&cast(root(), to.clone())).unwrap();
+        assert_eq!(result.dtype(), &to);
+        assert_eq!(
+            result.scalar_at(0).unwrap(),
+            Scalar::decimal(
+                DecimalValue::I256(i256::from_i128(12300)),
+                to_dtype,
+                Nullability::NonNullable,
+            ),
+        );
+        assert_eq!(
+            result.scalar_at(1).unwrap(),
+            Scalar::decimal(
+                DecimalValue::I256(i256::from_i128(67800)),
+                to_dtype,
+                Nullability::NonNullable,
+            ),
+        );
+    }
 
     #[test]
     fn dtype() {

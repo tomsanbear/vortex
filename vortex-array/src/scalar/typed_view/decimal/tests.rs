@@ -115,7 +115,8 @@ fn test_decimal_cast_between_decimal_types() {
         Nullability::NonNullable,
     );
 
-    // Cast to different decimal type (currently just preserves value)
+    // Cast to a different precision/scale: the mantissa rescales by the scale
+    // delta (2 -> 4), so 123.45 stays 123.45.
     let result = decimal_scalar
         .cast(&DType::Decimal(
             DecimalDType::new(20, 4),
@@ -123,9 +124,12 @@ fn test_decimal_cast_between_decimal_types() {
         ))
         .unwrap();
 
-    // Value should be preserved (TODO(connor): proper scaling logic - whatever that means???)
+    // 12345 at scale 2 becomes 1234500 at scale 4.
     let decimal_value: Option<DecimalValue> = result.try_into().unwrap();
-    assert_eq!(decimal_value, Some(DecimalValue::I32(12345)));
+    assert_eq!(
+        decimal_value,
+        Some(DecimalValue::I256(i256::from_i128(1234500)))
+    );
 }
 
 #[test]
@@ -308,8 +312,8 @@ fn test_decimal_to_decimal_different_scale() {
         Nullability::NonNullable,
     );
 
-    // Cast to decimal with scale=4
-    // TODO: This should properly rescale, but for now it preserves the raw value
+    // Cast to decimal with scale=4: the mantissa rescales by 10^(4-2), so
+    // 100.00 (raw 10000) becomes 100.0000 (raw 1000000).
     let target_dtype = DType::Decimal(DecimalDType::new(10, 4), Nullability::NonNullable);
     let result = decimal.cast(&target_dtype);
     assert!(result.is_ok());
@@ -317,7 +321,7 @@ fn test_decimal_to_decimal_different_scale() {
     let casted = result.unwrap();
     assert_eq!(
         casted.as_decimal().decimal_value(),
-        Some(DecimalValue::I32(10000))
+        Some(DecimalValue::I256(i256::from_i128(1000000)))
     );
 }
 

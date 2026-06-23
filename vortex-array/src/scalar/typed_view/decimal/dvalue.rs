@@ -165,6 +165,34 @@ impl DecimalValue {
     pub fn checked_div(&self, other: &Self) -> Option<Self> {
         self.checked_binary_op(other, |a, b| a.checked_div(&b))
     }
+
+    /// Rescale this value's mantissa from `from_scale` to `to_scale`, returning an
+    /// [`I256`](DecimalValue::I256) value. Widening the scale multiplies by
+    /// `10^delta` (exact); narrowing divides by `10^|delta|` with
+    /// round-half-away-from-zero (matching Arrow's decimal-cast rounding).
+    /// Returns `None` if the result, or the `10^|delta|` factor, overflows `i256`.
+    pub fn rescale(&self, from_scale: i8, to_scale: i8) -> Option<Self> {
+        rescale_i256(self.as_i256(), from_scale, to_scale).map(DecimalValue::I256)
+    }
+}
+
+/// Rescale a raw `i256` mantissa from `from_scale` to `to_scale`. Shared by the
+/// decimal array cast kernel and the decimal scalar cast so both round identically.
+pub(crate) fn rescale_i256(value: i256, from_scale: i8, to_scale: i8) -> Option<i256> {
+    let delta = i32::from(to_scale) - i32::from(from_scale);
+    let factor = i256::from_i128(10).checked_pow(delta.unsigned_abs())?;
+    if delta >= 0 {
+        value.checked_mul(&factor)
+    } else {
+        // Round half away from zero before truncating division.
+        let half = factor / i256::from_i128(2);
+        let rounded = if value >= i256::ZERO {
+            value + half
+        } else {
+            value - half
+        };
+        rounded.checked_div(&factor)
+    }
 }
 
 // Additional trait implementations for decimal types to ensure consistency.
