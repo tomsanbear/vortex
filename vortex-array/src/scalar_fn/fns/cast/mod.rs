@@ -242,6 +242,7 @@ mod tests {
     use crate::dtype::Nullability;
     use crate::dtype::PType;
     use crate::dtype::i256;
+    use crate::executor::VortexSessionExecute;
     use crate::expr::Expression;
     use crate::expr::cast;
     use crate::expr::get_item;
@@ -250,7 +251,6 @@ mod tests {
     use crate::expr::test_harness;
     use crate::scalar::DecimalValue;
     use crate::scalar::Scalar;
-    use crate::executor::VortexSessionExecute;
     use crate::scalar_fn::fns::literal::Literal;
     use crate::validity::Validity;
 

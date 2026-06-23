@@ -132,7 +132,6 @@ impl CompressorContext {
     }
 }
 
-#[cfg(test)]
 impl Default for CompressorContext {
     fn default() -> Self {
         Self::new()

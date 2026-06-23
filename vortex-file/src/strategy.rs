@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use vortex_array::ArrayId;
 use vortex_array::dtype::FieldPath;
+use vortex_array::expr::stats::Stat;
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
 use vortex_btrblocks::SchemeExt;
 use vortex_btrblocks::schemes::integer::IntDictScheme;
@@ -68,7 +69,7 @@ pub struct WriteStrategyBuilder {
     /// call. `None` keeps the default of [`Stat::all()`]; callers
     /// that know their scheme set never reads certain stats can
     /// narrow this to skip the corresponding per-fragment scans.
-    compressing_stats: Option<Arc<[vortex_array::expr::stats::Stat]>>,
+    compressing_stats: Option<Arc<[Stat]>>,
     /// Whether to write list fields using [`ListLayoutStrategy`].
     ///
     /// [`ListLayoutStrategy`]: vortex_layout::layouts::list::writer::ListLayoutStrategy
@@ -185,7 +186,7 @@ impl WriteStrategyBuilder {
     /// Override the per-chunk stats that the leaf `CompressingStrategy`
     /// pre-computes before each compression call.
     ///
-    /// Defaults to [`Stat::all()`](vortex_array::expr::stats::Stat::all),
+    /// Defaults to [`Stat::all()`],
     /// which costs a per-fragment scan for every stat in the enum (some
     /// share a single scan, some don't). Callers whose scheme set
     /// reads only a subset can narrow this to skip the
@@ -193,10 +194,7 @@ impl WriteStrategyBuilder {
     /// `NaNCount` scans (or any other unused stat). The narrowed set
     /// is shared by both the fallback chain and every per-field
     /// override.
-    pub fn with_compressing_stats(
-        mut self,
-        stats: impl IntoIterator<Item = vortex_array::expr::stats::Stat>,
-    ) -> Self {
+    pub fn with_compressing_stats(mut self, stats: impl IntoIterator<Item = Stat>) -> Self {
         self.compressing_stats = Some(stats.into_iter().collect());
         self
     }
@@ -287,67 +285,68 @@ impl WriteStrategyBuilder {
         // into the leaf `CompressingStrategy`. The chain is identical
         // shape for every field; only the data compressor varies.
         let compressing_stats = self.compressing_stats.clone();
-        let build_field_chain = |data_compressor: Arc<dyn CompressorPlugin>| -> Arc<dyn LayoutStrategy> {
-            // 7. for each chunk create a flat layout
-            let chunked = ChunkedLayoutStrategy::new(Arc::clone(&flat));
-            // 6. buffer chunks so they end up with closer segment ids physically
-            let buffered = BufferedStrategy::new(chunked, 2 * ONE_MEG); // 2MB
+        let build_field_chain =
+            |data_compressor: Arc<dyn CompressorPlugin>| -> Arc<dyn LayoutStrategy> {
+                // 7. for each chunk create a flat layout
+                let chunked = ChunkedLayoutStrategy::new(Arc::clone(&flat));
+                // 6. buffer chunks so they end up with closer segment ids physically
+                let buffered = BufferedStrategy::new(chunked, 2 * ONE_MEG); // 2MB
 
-            let mut compressing = CompressingStrategy::new(buffered, data_compressor);
-            if let Some(stats) = compressing_stats.as_deref() {
-                compressing = compressing.with_stats(stats);
-            }
+                let mut compressing = CompressingStrategy::new(buffered, data_compressor);
+                if let Some(stats) = compressing_stats.as_deref() {
+                    compressing = compressing.with_stats(stats);
+                }
 
-            // 4. prior to compression, coalesce up to a minimum size
-            let coalescing = RepartitionStrategy::new(
-                compressing,
-                RepartitionWriterOptions {
-                    // Write stream partitions roughly become segments. Because Vortex never reads
-                    // less than one segment, the size of segments and, therefore, partitions, must
-                    // be small enough to both (1) allow fine-grained random access reads and (2)
-                    // allow sufficient read concurrency for the desired throughput. One megabyte is
-                    // small enough to achieve this for S3 (Durner et al., "Exploiting Cloud Object
-                    // Storage for High-Performance Analytics", VLDB Vol 16, Iss 11).
-                    block_size_minimum: self.data_block_target_bytes.unwrap_or(0),
-                    block_len_multiple: self.row_block_size,
-                    block_size_target: self.data_block_target_bytes,
-                    canonicalize: true,
-                },
-            );
+                // 4. prior to compression, coalesce up to a minimum size
+                let coalescing = RepartitionStrategy::new(
+                    compressing,
+                    RepartitionWriterOptions {
+                        // Write stream partitions roughly become segments. Because Vortex never reads
+                        // less than one segment, the size of segments and, therefore, partitions, must
+                        // be small enough to both (1) allow fine-grained random access reads and (2)
+                        // allow sufficient read concurrency for the desired throughput. One megabyte is
+                        // small enough to achieve this for S3 (Durner et al., "Exploiting Cloud Object
+                        // Storage for High-Performance Analytics", VLDB Vol 16, Iss 11).
+                        block_size_minimum: self.data_block_target_bytes.unwrap_or(0),
+                        block_len_multiple: self.row_block_size,
+                        block_size_target: self.data_block_target_bytes,
+                        canonicalize: true,
+                    },
+                );
 
-            // 3. apply dict encoding or fallback
-            let dict = DictStrategy::new(
-                coalescing.clone(),
-                compress_then_flat.clone(),
-                coalescing,
-                Default::default(),
-                Arc::clone(&probe_compressor),
-            );
+                // 3. apply dict encoding or fallback
+                let dict = DictStrategy::new(
+                    coalescing.clone(),
+                    compress_then_flat.clone(),
+                    coalescing,
+                    Default::default(),
+                    Arc::clone(&probe_compressor),
+                );
 
-            // 2. calculate stats for each row group
-            let stats = ZonedStrategy::new(
-                dict,
-                compress_then_flat.clone(),
-                ZonedLayoutOptions {
-                    block_size: row_block_size,
-                    ..Default::default()
-                },
-            );
+                // 2. calculate stats for each row group
+                let stats = ZonedStrategy::new(
+                    dict,
+                    compress_then_flat.clone(),
+                    ZonedLayoutOptions {
+                        block_size: row_block_size,
+                        ..Default::default()
+                    },
+                );
 
-            // 1. repartition each column to fixed row counts
-            let repartition = RepartitionStrategy::new(
-                stats,
-                RepartitionWriterOptions {
-                    // No minimum block size in bytes
-                    block_size_minimum: 0,
-                    // Always repartition into 8K row blocks
-                    block_len_multiple: self.row_block_size,
-                    block_size_target: None,
-                    canonicalize: false,
-                },
-            );
-            Arc::new(repartition)
-        };
+                // 1. repartition each column to fixed row counts
+                let repartition = RepartitionStrategy::new(
+                    stats,
+                    RepartitionWriterOptions {
+                        // No minimum block size in bytes
+                        block_size_minimum: 0,
+                        // Always repartition into 8K row blocks
+                        block_len_multiple: self.row_block_size,
+                        block_size_target: None,
+                        canonicalize: false,
+                    },
+                );
+                Arc::new(repartition)
+            };
 
         // Convert per-field compressor overrides into per-field
         // `LayoutStrategy` entries with the shared chain shape, then

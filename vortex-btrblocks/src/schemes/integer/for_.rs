@@ -92,6 +92,10 @@ impl Scheme for FoRScheme {
         // direct-stats-read pattern.
         let primitive = data.array_as_primitive();
         let array_ref = primitive.as_ref();
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "PType bit width is at most 64, which fits in u32"
+        )]
         let full_width = primitive.ptype().bit_width() as u32;
         #[allow(unused_comparisons, clippy::absurd_extreme_comparisons)]
         let (min_is_zero, min_is_negative, max_minus_min, max_value_u128) =
@@ -138,12 +142,10 @@ impl Scheme for FoRScheme {
         // the reference) for effectively no benefits. Only consult when
         // min >= 0 because BitPacking can't be applied without ZigZag
         // otherwise.
-        if !min_is_negative {
-            if let Some(max_log) = max_value_u128.checked_ilog2() {
-                let bitpack_bitwidth = max_log + 1;
-                if for_bitwidth >= bitpack_bitwidth {
-                    return CompressionEstimate::Verdict(EstimateVerdict::Skip);
-                }
+        if !min_is_negative && let Some(max_log) = max_value_u128.checked_ilog2() {
+            let bitpack_bitwidth = max_log + 1;
+            if for_bitwidth >= bitpack_bitwidth {
+                return CompressionEstimate::Verdict(EstimateVerdict::Skip);
             }
         }
 
