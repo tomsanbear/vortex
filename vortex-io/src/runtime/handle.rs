@@ -55,7 +55,18 @@ impl Handle {
             }
         }
 
-        None
+        // On wasm32 there is no Tokio runtime to find; the shipped `WasmRuntime`
+        // is the only executor, so auto-select it. Any Vortex consumer then runs
+        // on wasm32 without an explicit `with_handle(WasmRuntime)` install.
+        #[cfg(target_arch = "wasm32")]
+        {
+            return Some(crate::runtime::wasm::WasmRuntime::handle());
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            None
+        }
     }
 
     /// Spawn a new future onto the runtime.
