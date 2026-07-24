@@ -510,11 +510,19 @@ impl FileOpener for VortexOpener {
                 })
                 .into_stream()
                 .map_err(|e| exec_datafusion_err!("Failed to create Vortex stream: {e}"))?
-                .map_err(move |e: VortexError| {
-                    DataFusionError::External(Box::new(e.with_context(format!(
-                        "Failed to read Vortex file: {}",
-                        file.object_meta.location
-                    ))))
+                .map_err(move |e: VortexError| match e {
+                    // An Arrow error surfacing from record-batch production is a
+                    // query-evaluation failure on a pushed-down expression
+                    // (arithmetic overflow, divide-by-zero), not a file-read
+                    // failure — surface it as an Arrow error so the message names
+                    // the actual fault instead of mislabelling it as a corrupt or
+                    // unreadable file.
+                    VortexError::Arrow(arrow_err, _) => {
+                        DataFusionError::ArrowError(Box::new(arrow_err), None)
+                    }
+                    other => DataFusionError::External(Box::new(other.with_context(
+                        format!("Failed to read Vortex file: {}", file.object_meta.location),
+                    ))),
                 })
                 .map(move |batch| {
                     let batch = if projector.projection().as_ref().is_empty() {
