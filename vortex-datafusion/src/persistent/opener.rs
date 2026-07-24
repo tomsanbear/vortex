@@ -7,6 +7,7 @@ use std::sync::LazyLock;
 use std::sync::Weak;
 
 use arrow_array::RecordBatchOptions;
+use arrow_schema::ArrowError;
 use arrow_schema::Field;
 use arrow_schema::Schema;
 use datafusion_common::DataFusionError;
@@ -69,6 +70,37 @@ use crate::metrics::PATH_LABEL;
 use crate::persistent::cache::CachedVortexMetadata;
 use crate::persistent::reader::VortexReaderFactory;
 use crate::persistent::stream::PrunableStream;
+
+/// Peel `Shared`/`Context` wrappers off a scan-stream `VortexError` and, if the
+/// root is a query-evaluation Arrow error — a pushed-down predicate that
+/// overflowed, divided by zero, or otherwise failed to compute — reconstruct
+/// it. Such an error means the predicate could not be evaluated, not that the
+/// file could not be read, so the caller surfaces it as a DataFusion
+/// `ArrowError` rather than mislabelling it as an unreadable file. Read/parse
+/// failures (every other variant) return `None` and keep the read-file context.
+///
+/// The evaluation error is produced deep in the scalar-fn engine as
+/// `VortexError::Arrow`, but the `MaskFuture` that drives filter evaluation is
+/// `Shared`, so awaiting it re-wraps the error as `VortexError::Shared(Arc<…>)`
+/// (and a `Context` layer may sit above that); the structured `ArrowError`
+/// survives intact one or two levels down. `arrow_schema::ArrowError` is not
+/// `Clone`, so the compute variants are rebuilt by hand.
+fn evaluation_arrow_error(e: &VortexError) -> Option<ArrowError> {
+    match e {
+        VortexError::Arrow(arrow_err, _) => match arrow_err {
+            ArrowError::ArithmeticOverflow(msg) => {
+                Some(ArrowError::ArithmeticOverflow(msg.clone()))
+            }
+            ArrowError::DivideByZero => Some(ArrowError::DivideByZero),
+            ArrowError::ComputeError(msg) => Some(ArrowError::ComputeError(msg.clone())),
+            ArrowError::CastError(msg) => Some(ArrowError::CastError(msg.clone())),
+            _ => None,
+        },
+        VortexError::Shared(inner) => evaluation_arrow_error(inner.as_ref()),
+        VortexError::Context(_, inner) => evaluation_arrow_error(inner.as_ref()),
+        _ => None,
+    }
+}
 
 /// Whether to route a pushed-down dynamic filter's selective `InList` into the in-scan filter
 /// (on by default). `VORTEX_DYNAMIC_INSCAN=0` disables it — the dynamic still feeds the file-level
@@ -510,19 +542,18 @@ impl FileOpener for VortexOpener {
                 })
                 .into_stream()
                 .map_err(|e| exec_datafusion_err!("Failed to create Vortex stream: {e}"))?
-                .map_err(move |e: VortexError| match e {
-                    // An Arrow error surfacing from record-batch production is a
-                    // query-evaluation failure on a pushed-down expression
-                    // (arithmetic overflow, divide-by-zero), not a file-read
-                    // failure — surface it as an Arrow error so the message names
-                    // the actual fault instead of mislabelling it as a corrupt or
-                    // unreadable file.
-                    VortexError::Arrow(arrow_err, _) => {
-                        DataFusionError::ArrowError(Box::new(arrow_err), None)
-                    }
-                    other => DataFusionError::External(Box::new(other.with_context(
-                        format!("Failed to read Vortex file: {}", file.object_meta.location),
-                    ))),
+                .map_err(move |e: VortexError| match evaluation_arrow_error(&e) {
+                    // A query-evaluation Arrow error surfacing from record-batch
+                    // production (a pushed-down predicate that overflowed, divided
+                    // by zero, or failed to compute) is not a file-read failure —
+                    // surface it as an Arrow error so the message names the actual
+                    // fault instead of mislabelling it as a corrupt/unreadable
+                    // file. Genuine read/parse errors keep the read-file context.
+                    Some(arrow_err) => DataFusionError::ArrowError(Box::new(arrow_err), None),
+                    None => DataFusionError::External(Box::new(e.with_context(format!(
+                        "Failed to read Vortex file: {}",
+                        file.object_meta.location
+                    )))),
                 })
                 .map(move |batch| {
                     let batch = if projector.projection().as_ref().is_empty() {
