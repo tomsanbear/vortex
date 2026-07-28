@@ -550,10 +550,21 @@ impl FileOpener for VortexOpener {
                     // fault instead of mislabelling it as a corrupt/unreadable
                     // file. Genuine read/parse errors keep the read-file context.
                     Some(arrow_err) => DataFusionError::ArrowError(Box::new(arrow_err), None),
-                    None => DataFusionError::External(Box::new(e.with_context(format!(
-                        "Failed to read Vortex file: {}",
-                        file.object_meta.location
-                    )))),
+                    // Genuine read/parse errors keep the read-file LABEL but not
+                    // the object's location. Upstream (#4369) interpolates
+                    // `file.object_meta.location` here, which is right for a
+                    // library whose caller named the file it wanted; it is wrong
+                    // for an embedder whose object-store layout is internal
+                    // detail, because this message reaches an end user through
+                    // DataFusionError::External and there is no typed field to
+                    // scrub it out of afterwards.
+                    //
+                    // The location is not lost to whoever needs it: the scan
+                    // already knows which file it opened, and the tracing span
+                    // covering this read carries it.
+                    None => DataFusionError::External(Box::new(
+                        e.with_context("Failed to read Vortex file"),
+                    )),
                 })
                 .map(move |batch| {
                     let batch = if projector.projection().as_ref().is_empty() {
