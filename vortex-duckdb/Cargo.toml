@@ -43,6 +43,7 @@ vortex = { workspace = true, features = [
     "tokio",
     "object_store",
     "object_store_registry",
+    "profiling-labels",
 ] }
 vortex-geo = { workspace = true }
 vortex-utils = { workspace = true, features = ["dashmap"] }

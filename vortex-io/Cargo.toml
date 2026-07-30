@@ -42,7 +42,11 @@ vortex-session = { workspace = true }
 vortex-utils = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-custom-labels = { workspace = true }
+# Optional: profiler labelling on the tokio executor's spawns. Behind the
+# `profiling-labels` feature because the crate's build runs a C++ compile plus
+# bindgen (dragging clang-sys and its closure) — a heavy toll to impose on
+# every consumer for observability labels most never read.
+custom-labels = { workspace = true, optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # Smol is our default impl, so we don't want it to be optional, but it cannot be part of wasm
@@ -62,6 +66,9 @@ tokio = { workspace = true, features = ["full"] }
 
 [features]
 object_store = ["dep:object_store", "vortex-error/object_store"]
+# Label tokio-spawned work with custom-labels so external profilers attribute
+# samples to Vortex tasks. Costs a C++ + bindgen build; see the dependency note.
+profiling-labels = ["dep:custom-labels"]
 tokio = ["tokio/fs", "tokio/rt-multi-thread"]
 
 [[example]]

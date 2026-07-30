@@ -46,7 +46,7 @@ opentelemetry_sdk.workspace = true
 parking_lot = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 url = { workspace = true }
-vortex = { workspace = true, features = ["object_store", "files", "tokio"] }
+vortex = { workspace = true, features = ["object_store", "files", "tokio", "profiling-labels"] }
 vortex-arrow = { workspace = true }
 vortex-bench = { workspace = true }
 vortex-cuda = { workspace = true, optional = true }

@@ -78,6 +78,7 @@ object_store = ["vortex-file?/object_store", "vortex-io/object_store"]
 object_store_registry = ["object_store", "vortex-cloud/registry"]
 # OpenDAL-backed schemes (`cos://`, `oss://`) in the object store registry.
 opendal = ["object_store_registry", "vortex-cloud/opendal"]
+profiling-labels = ["vortex-io/profiling-labels"]
 tokio = [
     "vortex-error/tokio",
     "vortex-file?/tokio",
