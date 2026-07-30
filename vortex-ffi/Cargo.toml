@@ -29,7 +29,7 @@ mimalloc = { workspace = true, optional = true }
 paste = { workspace = true }
 tracing = { workspace = true, features = ["log"] }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
-vortex = { workspace = true, features = ["object_store"] }
+vortex = { workspace = true, features = ["object_store", "smol-runtime"] }
 vortex-arrow = { workspace = true }
 
 [dev-dependencies]

@@ -24,8 +24,8 @@ use object_store::RenameOptions;
 use object_store::Result;
 use object_store::UploadPart;
 use object_store::path::Path;
-use smol::future::FutureExt;
-use smol::stream::StreamExt;
+use futures::future::FutureExt;
+use futures::stream::StreamExt;
 
 use crate::compat::Compat;
 

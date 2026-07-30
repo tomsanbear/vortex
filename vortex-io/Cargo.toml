@@ -49,8 +49,12 @@ vortex-utils = { workspace = true }
 custom-labels = { workspace = true, optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-# Smol is our default impl, so we don't want it to be optional, but it cannot be part of wasm
-smol = { workspace = true }
+# Smol backs the non-tokio threading models (single / current / pool). It is
+# the default impl, so `smol-runtime` sits in the default feature set; a
+# consumer that only ever drives Vortex through the tokio Executor can opt
+# out with default-features = false and shed the second async runtime.
+# Cannot be part of wasm.
+smol = { workspace = true, optional = true }
 
 # target_os = "unknown" matches wasm32-unknown-unknown (browser), excluding WASI targets
 # where wasm-bindgen's JS interop is not available.
@@ -65,10 +69,14 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 
 [features]
+default = ["smol-runtime"]
 object_store = ["dep:object_store", "vortex-error/object_store"]
 # Label tokio-spawned work with custom-labels so external profilers attribute
 # samples to Vortex tasks. Costs a C++ + bindgen build; see the dependency note.
 profiling-labels = ["dep:custom-labels"]
+# The smol-backed runtime modules (runtime::{single, current, pool}). On by
+# default; see the smol dependency note.
+smol-runtime = ["dep:smol"]
 tokio = ["tokio/fs", "tokio/rt-multi-thread"]
 
 [[example]]

@@ -44,6 +44,7 @@ vortex = { workspace = true, features = [
     "object_store",
     "object_store_registry",
     "profiling-labels",
+    "smol-runtime",
 ] }
 vortex-geo = { workspace = true }
 vortex-utils = { workspace = true, features = ["dashmap"] }

@@ -57,6 +57,7 @@ url = { workspace = true }
 vortex = { workspace = true, features = [
     "object_store",
     "object_store_registry",
+    "smol-runtime",
 ] }
 vortex-arrow = { workspace = true }
 vortex-cloud = { workspace = true, optional = true }

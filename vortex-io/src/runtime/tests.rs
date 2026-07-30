@@ -20,6 +20,7 @@ use vortex_error::VortexResult;
 
 use crate::VortexReadAt;
 use crate::runtime::Task;
+#[cfg(feature = "smol-runtime")]
 use crate::runtime::single::block_on;
 use crate::runtime::tokio::TokioRuntime;
 use crate::std_file::FileReadAt;
@@ -33,6 +34,7 @@ const TEST_LEN: usize = 5;
 // Basic FileRead tests with in-memory buffer
 // ============================================================================
 
+#[cfg(feature = "smol-runtime")]
 #[test]
 fn test_file_read_with_single_thread_runtime() {
     let result = block_on(|_handle| {
@@ -89,6 +91,7 @@ async fn test_file_read_with_tokio_runtime() {
 // Test with actual files
 // ============================================================================
 
+#[cfg(feature = "smol-runtime")]
 #[test]
 fn test_file_read_with_real_file_single_thread() {
     use std::io::Write;
@@ -199,6 +202,7 @@ async fn test_concurrent_reads() {
 // Test Handle spawn methods
 // ============================================================================
 
+#[cfg(feature = "smol-runtime")]
 #[test]
 fn test_handle_spawn_future() {
     let result = block_on(|handle| {
@@ -386,6 +390,7 @@ async fn test_task_detach() {
 // Test nested spawns
 // ============================================================================
 
+#[cfg(feature = "smol-runtime")]
 #[test]
 fn test_nested_spawns() {
     let result =

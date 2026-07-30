@@ -19,13 +19,13 @@ pub use blocking::*;
 mod handle;
 pub use handle::*;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "smol-runtime"))]
 pub mod current;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "smol-runtime"))]
 mod pool;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "smol-runtime"))]
 pub mod single;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "smol-runtime"))]
 mod smol;
 #[cfg(feature = "tokio")]
 pub mod tokio;
