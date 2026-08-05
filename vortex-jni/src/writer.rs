@@ -410,9 +410,28 @@ pub extern "system" fn Java_dev_vortex_jni_NativeWriter_create(
                 let mut write = CountingVortexWrite::new(object_write);
                 let bytes_written = write.counter();
                 let handle = session.handle().spawn(async move {
-                    let summary = write_options.write(&mut write, stream).await?;
-                    write.shutdown().await?;
-                    Ok(summary)
+                    let result = async {
+                        let summary = write_options.write(&mut write, stream).await?;
+                        write.shutdown().await?;
+                        VortexResult::Ok(summary)
+                    }
+                    .await;
+                    match result {
+                        Ok(summary) => Ok(summary),
+                        Err(e) => {
+                            // A failed write must not leave an initiated multipart upload
+                            // behind on the store. Abort is best-effort; the primary
+                            // error wins.
+                            if let Err(abort_err) = write.into_inner().abort().await {
+                                tracing::warn!(
+                                    %path,
+                                    error = %abort_err,
+                                    "failed to abort in-flight multipart upload after write error"
+                                );
+                            }
+                            Err(e)
+                        }
+                    }
                 });
                 (bytes_written, handle)
             }

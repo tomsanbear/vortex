@@ -157,18 +157,38 @@ impl FileSink for VortexSink {
                     .await
                     .map_err(|e| exec_datafusion_err!("Failed to create ObjectStoreWrite: {e}"))?;
 
-                let summary = session
-                    .write_options()
-                    .write(&mut object_writer, stream_adapter)
-                    .await
-                    .map_err(|e| exec_datafusion_err!("Failed to write Vortex file: {e}"))?;
+                let result = async {
+                    let summary = session
+                        .write_options()
+                        .write(&mut object_writer, stream_adapter)
+                        .await
+                        .map_err(|e| exec_datafusion_err!("Failed to write Vortex file: {e}"))?;
 
-                object_writer
-                    .shutdown()
-                    .await
-                    .map_err(|e| exec_datafusion_err!("Failed to shutdown Vortex writer: {e}"))?;
+                    object_writer.shutdown().await.map_err(|e| {
+                        exec_datafusion_err!("Failed to shutdown Vortex writer: {e}")
+                    })?;
 
-                Ok((path, summary))
+                    Ok::<_, DataFusionError>(summary)
+                }
+                .await;
+
+                match result {
+                    Ok(summary) => Ok((path, summary)),
+                    Err(e) => {
+                        // A failed encode (or a failed multipart complete) must not leave
+                        // an initiated-but-never-completed multipart upload behind: on
+                        // S3/GCS those parts are billable until a lifecycle rule reaps
+                        // them. Abort is best-effort; the primary error wins.
+                        if let Err(abort_err) = object_writer.abort().await {
+                            tracing::warn!(
+                                %path,
+                                error = %abort_err,
+                                "failed to abort in-flight multipart upload after write error"
+                            );
+                        }
+                        Err(e)
+                    }
+                }
             });
         }
 

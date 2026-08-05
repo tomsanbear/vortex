@@ -28,6 +28,12 @@ impl<W: VortexWrite> CountingVortexWrite<W> {
     pub fn counter(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.bytes_written)
     }
+
+    /// Consumes the wrapper and returns the inner writer, e.g. to run a
+    /// writer-specific error-path cleanup like `ObjectStoreWrite::abort`.
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
 }
 
 impl<W: VortexWrite + Unpin> VortexWrite for CountingVortexWrite<W> {

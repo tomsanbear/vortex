@@ -253,12 +253,23 @@ pub fn write(
         RUNTIME.block_on(async move {
             match resolve_store(path, store.map(|x| x.into_inner()))? {
                 ResolvedStore::ObjectStore(store, path) => {
-                    let mut store = ObjectStoreWrite::new(store, &path).await?;
-                    session
-                        .write_options()
-                        .write(&mut store, iter.into_inner().into_array_stream())
-                        .await?;
-                    store.shutdown().await?;
+                    let mut writer = ObjectStoreWrite::new(store, &path).await?;
+                    let result = async {
+                        session
+                            .write_options()
+                            .write(&mut writer, iter.into_inner().into_array_stream())
+                            .await?;
+                        writer.shutdown().await?;
+                        VortexResult::Ok(())
+                    }
+                    .await;
+                    if let Err(e) = result {
+                        // Best-effort: don't leave an initiated multipart upload behind.
+                        // A failed abort keeps the writer's own drop warning, and the
+                        // primary error wins.
+                        let _abort_result = writer.abort().await;
+                        return Err(e);
+                    }
                     VortexResult::Ok(())
                 }
                 ResolvedStore::Path(path) => {
@@ -388,13 +399,24 @@ impl PyVortexWriteOptions {
             RUNTIME.block_on(async move {
                 match resolve_store(path, store.map(|x| x.into_inner()))? {
                     ResolvedStore::ObjectStore(store, path) => {
-                        let mut store = ObjectStoreWrite::new(store, &path).await?;
-                        session
-                            .write_options()
-                            .with_strategy(strategy)
-                            .write(&mut store, iter.into_inner().into_array_stream())
-                            .await?;
-                        store.shutdown().await?;
+                        let mut writer = ObjectStoreWrite::new(store, &path).await?;
+                        let result = async {
+                            session
+                                .write_options()
+                                .with_strategy(strategy)
+                                .write(&mut writer, iter.into_inner().into_array_stream())
+                                .await?;
+                            writer.shutdown().await?;
+                            VortexResult::Ok(())
+                        }
+                        .await;
+                        if let Err(e) = result {
+                            // Best-effort: don't leave an initiated multipart upload
+                            // behind. A failed abort keeps the writer's own drop
+                            // warning, and the primary error wins.
+                            let _abort_result = writer.abort().await;
+                            return Err(e);
+                        }
                         VortexResult::Ok(())
                     }
                     ResolvedStore::Path(path) => {

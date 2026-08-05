@@ -76,6 +76,28 @@ impl ObjectStoreWrite {
         Ok(())
     }
 
+    /// Abort the write, cleaning up any in-flight multipart upload on the store.
+    ///
+    /// The explicit error-path counterpart to `shutdown`: a caller whose write fails
+    /// after the buffer has split must call this, or the initiated-but-never-completed
+    /// multipart upload survives server-side — billable orphaned parts on S3/GCS until a
+    /// lifecycle rule reaps them, uncommitted blocks on Azure for 7 days. A writer that
+    /// never split has nothing server-side to clean up, so aborting it is a no-op.
+    ///
+    /// Consumes the writer: there is nothing meaningful to write after an abort.
+    pub async fn abort(mut self) -> io::Result<()> {
+        // A completed write has nothing to clean up — aborting the (already completed)
+        // multipart upload here would be an error against the store.
+        if self.put_result.is_some() {
+            return Ok(());
+        }
+        if let Some(upload) = self.upload.as_mut() {
+            upload.abort().await?;
+        }
+        self.upload = None;
+        Ok(())
+    }
+
     /// Drain every whole `CHUNK_SIZE` part out of the buffer, starting the upload on
     /// first use.
     ///
@@ -99,6 +121,24 @@ impl ObjectStoreWrite {
             parts.try_collect::<Vec<_>>().await?;
         }
         Ok(())
+    }
+}
+
+/// Forgot-to-call backstop, not the cleanup path: `Drop` cannot `.await` and vortex-io
+/// has no ambient runtime to spawn the abort onto (tokio, smol, and wasm are all
+/// supported targets), so a dropped writer with an in-flight multipart upload can only
+/// be reported, never cleaned up. Callers own the explicit path: `shutdown` on success,
+/// [`ObjectStoreWrite::abort`] on failure.
+impl Drop for ObjectStoreWrite {
+    fn drop(&mut self) {
+        if self.upload.is_some() && self.put_result.is_none() {
+            tracing::warn!(
+                location = %self.location,
+                "ObjectStoreWrite dropped with an in-flight multipart upload; the store \
+                 retains its orphaned parts until a lifecycle rule reaps them — call \
+                 abort() on the error path"
+            );
+        }
     }
 }
 
@@ -234,6 +274,8 @@ mod tests {
         puts: AtomicUsize,
         multiparts: AtomicUsize,
         parts: AtomicUsize,
+        completes: AtomicUsize,
+        aborts: AtomicUsize,
     }
 
     impl WriteCounts {
@@ -242,6 +284,13 @@ mod tests {
                 self.puts.load(Ordering::SeqCst),
                 self.multiparts.load(Ordering::SeqCst),
                 self.parts.load(Ordering::SeqCst),
+            )
+        }
+
+        fn settlement(&self) -> (usize, usize) {
+            (
+                self.completes.load(Ordering::SeqCst),
+                self.aborts.load(Ordering::SeqCst),
             )
         }
     }
@@ -329,10 +378,12 @@ mod tests {
         }
 
         async fn complete(&mut self) -> object_store::Result<PutResult> {
+            self.counts.completes.fetch_add(1, Ordering::SeqCst);
             self.inner.complete().await
         }
 
         async fn abort(&mut self) -> object_store::Result<()> {
+            self.counts.aborts.fetch_add(1, Ordering::SeqCst);
             self.inner.abort().await
         }
     }
@@ -404,6 +455,54 @@ mod tests {
         );
         let bytes = store.get(&location).await?.bytes().await?;
         assert_eq!(bytes, vec![9u8; 2048]);
+        Ok(())
+    }
+
+    /// The error path a caller takes when encoding fails after the buffer has split:
+    /// `abort()` must settle the in-flight multipart upload (no orphaned parts left on
+    /// the store) and the object must not exist.
+    #[tokio::test]
+    async fn abort_after_split_settles_the_multipart_upload() -> anyhow::Result<()> {
+        let (store, counts) = counting_store();
+        let location = Path::from("aborted.bin");
+
+        let mut writer = ObjectStoreWrite::new(Arc::clone(&store), &location).await?;
+        writer.write_all(vec![5u8; CHUNK_SIZE + 4096]).await?;
+        writer.flush().await?;
+        // The caller's encode fails here; instead of shutdown, the error path aborts.
+        writer.abort().await?;
+
+        assert_eq!(
+            counts.snapshot(),
+            (0, 1, 1),
+            "upload started, one part sent"
+        );
+        assert_eq!(
+            counts.settlement(),
+            (0, 1),
+            "the upload must be aborted, never completed"
+        );
+        assert!(
+            store.get(&location).await.is_err(),
+            "an aborted write must not leave an object"
+        );
+        Ok(())
+    }
+
+    /// Aborting a writer that never split is a no-op: no upload was ever initiated, so
+    /// there is nothing server-side to settle.
+    #[tokio::test]
+    async fn abort_before_split_is_a_no_op() -> anyhow::Result<()> {
+        let (store, counts) = counting_store();
+        let location = Path::from("small-aborted.bin");
+
+        let mut writer = ObjectStoreWrite::new(Arc::clone(&store), &location).await?;
+        writer.write_all(vec![5u8; 4096]).await?;
+        writer.abort().await?;
+
+        assert_eq!(counts.snapshot(), (0, 0, 0));
+        assert_eq!(counts.settlement(), (0, 0));
+        assert!(store.get(&location).await.is_err());
         Ok(())
     }
 

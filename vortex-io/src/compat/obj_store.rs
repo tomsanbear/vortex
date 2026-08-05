@@ -7,7 +7,9 @@ use std::ops::Range;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::future::FutureExt;
 use futures::stream::BoxStream;
+use futures::stream::StreamExt;
 use object_store::CopyOptions;
 use object_store::GetOptions;
 use object_store::GetResult;
@@ -24,8 +26,6 @@ use object_store::RenameOptions;
 use object_store::Result;
 use object_store::UploadPart;
 use object_store::path::Path;
-use futures::future::FutureExt;
-use futures::stream::StreamExt;
 
 use crate::compat::Compat;
 
