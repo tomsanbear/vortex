@@ -442,6 +442,11 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
             return Ok(is_not_null(arg));
         }
 
+        if let Some(not_expr) = df.downcast_ref::<df_expr::NotExpr>() {
+            let arg = self.convert(not_expr.arg().as_ref())?;
+            return Ok(not(arg));
+        }
+
         if let Some(in_list) = df.downcast_ref::<df_expr::InListExpr>() {
             let value = self.convert(in_list.expr().as_ref())?;
             let list_elements: Vec<Scalar> = in_list
@@ -639,11 +644,17 @@ fn can_be_pushed_down_impl(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> boo
     } else if let Some(is_not_null) = expr.downcast_ref::<df_expr::IsNotNullExpr>() {
         can_be_pushed_down_impl(is_not_null.arg(), schema)
     } else if let Some(in_list) = expr.downcast_ref::<df_expr::InListExpr>() {
+        // Lockstep with convert()'s InList arm: it builds a constant list scalar, so it
+        // accepts only literal elements. A non-literal element (e.g. a column) must fail
+        // the gate here rather than pass and then error inside make_vortex_predicate,
+        // which would fail the whole query instead of leaving the filter to DataFusion.
         can_be_pushed_down_impl(in_list.expr(), schema)
-            && in_list
-                .list()
-                .iter()
-                .all(|e| can_be_pushed_down_impl(e, schema))
+            && in_list.list().iter().all(|e| {
+                e.downcast_ref::<df_expr::Literal>()
+                    .is_some_and(|literal| supported_data_types(&literal.value().data_type()))
+            })
+    } else if let Some(not_expr) = expr.downcast_ref::<df_expr::NotExpr>() {
+        can_be_pushed_down_impl(not_expr.arg(), schema)
     } else if let Some(scalar_fn) = expr.downcast_ref::<ScalarFunctionExpr>() {
         can_scalar_fn_be_pushed_down(scalar_fn, schema)
     } else if let Some(case_expr) = expr.downcast_ref::<df_expr::CaseExpr>() {
@@ -668,6 +679,9 @@ fn is_convertible_expr(expr: &Arc<dyn PhysicalExpr>) -> bool {
             .is_some_and(|e| is_convertible_expr(e.expr()))
         || expr.downcast_ref::<df_expr::IsNullExpr>().is_some()
         || expr.downcast_ref::<df_expr::IsNotNullExpr>().is_some()
+        || expr
+            .downcast_ref::<df_expr::NotExpr>()
+            .is_some_and(|e| is_convertible_expr(e.arg()))
         || expr.downcast_ref::<df_expr::InListExpr>().is_some()
         || expr.downcast_ref::<ScalarFunctionExpr>().is_some_and(|sf| {
             ScalarFunctionExpr::try_downcast_func::<GetFieldFunc>(sf).is_some()
@@ -1173,6 +1187,60 @@ mod tests {
             Arc::new(df_expr::LikeExpr::new(false, false, expr, pattern)) as Arc<dyn PhysicalExpr>;
 
         assert!(can_be_pushed_down_impl(&like_expr, &test_schema));
+    }
+
+    /// Gate/convert lockstep: convert()'s InList arm accepts only literal elements, so an
+    /// InList with a column element must fail the gate rather than pass and then error
+    /// inside make_vortex_predicate (which would fail the query on the accelerated path
+    /// instead of leaving the filter to DataFusion).
+    #[rstest]
+    fn test_can_be_pushed_down_inlist_rejects_column_elements(test_schema: Schema) {
+        let value = Arc::new(df_expr::Column::new("id", 0)) as Arc<dyn PhysicalExpr>;
+        let column_element = Arc::new(df_expr::Column::new("id", 0)) as Arc<dyn PhysicalExpr>;
+        let inlist = df_expr::in_list(value, vec![column_element], &false, &test_schema).unwrap();
+
+        assert!(!can_be_pushed_down_impl(&inlist, &test_schema));
+    }
+
+    /// The positive half of the lockstep: a literal-element InList passes the gate AND
+    /// converts, so the gate tightening above cannot over-reject.
+    #[rstest]
+    fn test_can_be_pushed_down_inlist_literal_elements_convert(test_schema: Schema) {
+        let value = Arc::new(df_expr::Column::new("id", 0)) as Arc<dyn PhysicalExpr>;
+        let list = vec![
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(1)))) as Arc<dyn PhysicalExpr>,
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(2)))) as Arc<dyn PhysicalExpr>,
+        ];
+        let inlist = df_expr::in_list(value, list, &false, &test_schema).unwrap();
+
+        assert!(can_be_pushed_down_impl(&inlist, &test_schema));
+        DefaultExpressionConvertor::default()
+            .convert(inlist.as_ref())
+            .expect("gate-accepted InList must convert");
+    }
+
+    #[rstest]
+    fn test_can_be_pushed_down_not_expr(test_schema: Schema) {
+        let arg = Arc::new(df_expr::Column::new("active", 3)) as Arc<dyn PhysicalExpr>;
+        let not_expr = Arc::new(df_expr::NotExpr::new(arg)) as Arc<dyn PhysicalExpr>;
+
+        assert!(can_be_pushed_down_impl(&not_expr, &test_schema));
+    }
+
+    #[test]
+    fn test_expr_from_df_not() {
+        let arg = Arc::new(df_expr::Column::new("active", 0)) as Arc<dyn PhysicalExpr>;
+        let not_expr = df_expr::NotExpr::new(arg);
+
+        let result = DefaultExpressionConvertor::default()
+            .convert(&not_expr)
+            .unwrap();
+
+        assert_snapshot!(result.display_tree().to_string(), @r"
+        vortex.not()
+        └── input: vortex.get_item(active)
+            └── input: vortex.root()
+        ");
     }
 
     #[rstest]
